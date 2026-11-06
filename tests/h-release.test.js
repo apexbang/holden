@@ -83,3 +83,19 @@ test('it refuses to release a clone onto itself', () => {
   const r = cp.spawnSync(RELEASE, ['--from', t.src.root, '--to', t.src.root], { env: t.env, encoding: 'utf8' });
   assert.equal(r.status, 1); assert.match(r.stdout + r.stderr, /is the installed copy/);
 });
+
+test('it refuses while a package is in flight in any repo, and a landed one does not count', () => {
+  const t = setup(); stamp(t);
+  const other = makeRepo();
+  const wt = path.join(t.env.XDG_CACHE_HOME, 'holden', 'wt', 'other-1', '261106-x');
+  fs.mkdirSync(wt, { recursive: true });
+  fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${path.join(other.root, '.git', 'worktrees', '261106-x')}\n`);
+  const reg = state => fs.writeFileSync(path.join(other.root, '.git', 'holden-registry.json'), JSON.stringify({ version: 1, packages: { '261106-x': { id: '261106-x', state } } }));
+  reg('admitted');
+  let r = release(t);
+  assert.equal(r.code, 1, r.out); assert.match(r.out, /in flight: 261106-x/);
+  assert.equal(read(t, 'bin/tool'), 'old\n');
+  reg('landed');
+  r = release(t);
+  assert.equal(r.code, 0, r.out);
+});

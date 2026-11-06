@@ -35,8 +35,8 @@ bin/h-release
 `DECISION.md`, `LICENSE` and `README.md` into the installed copy and commits them there. It leaves
 `.planning/`, `.holden/`, `docs/CONTEXT.md`, `.gitignore` and everything else that copy records. Each
 file is renamed into place, so a running script keeps the old file. It refuses a dirty clone, code
-with no passing full suite, a running Codex round and an uncommitted change to a file it would
-touch. If skills, agents or hooks were added or removed, run `bin/link` in the installed copy, then
+with no passing full suite, a running Codex round, a package in flight in any repo and an
+uncommitted change to a file it would touch. If skills, agents or hooks were added or removed, run `bin/link` in the installed copy, then
 restart open sessions.
 
 ## Models

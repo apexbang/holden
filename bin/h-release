@@ -8,7 +8,8 @@
 // removed only under those directories. Each file is written beside its target and renamed over
 // it, so a script that is running keeps the old file. The commit runs under the installed copy's
 // landing lock. Refused: a dirty source, a source with no passing full suite (h-test --full), a
-// running Codex round, and an uncommitted change to a file the release would touch.
+// running Codex round, a package in flight in any repo, and an uncommitted change to a file the
+// release would touch.
 // Exit 0 done or nothing to do, 1 refused or failed, 2 usage.
 const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process');
 
@@ -42,6 +43,27 @@ function plan() {
   const keep = new Set(want);
   return { copy: want.filter(f => !same(f)), remove: [...have].filter(f => !keep.has(f)).sort() };
 }
+// A package always has a worktree under the cache, and that worktree's .git file leads to its
+// repo's registry, so this finds every repo with work in flight without a list of repos.
+function inFlight() {
+  const wt = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'holden', 'wt');
+  const out = new Set(), seen = new Set();
+  for (const repo of fs.existsSync(wt) ? fs.readdirSync(wt) : []) {
+    let trees = [];
+    try { trees = fs.readdirSync(path.join(wt, repo)); } catch (e) { continue; }
+    for (const tree of trees) {
+      let reg;
+      try {
+        const m = fs.readFileSync(path.join(wt, repo, tree, '.git'), 'utf8').match(/^gitdir: (.+)$/m);
+        reg = path.join(path.resolve(m[1], '..', '..'), 'holden-registry.json');
+      } catch (e) { continue; }
+      if (seen.has(reg) || !fs.existsSync(reg)) continue;
+      seen.add(reg);
+      for (const p of Object.values(JSON.parse(fs.readFileSync(reg, 'utf8')).packages || {})) if (p.state === 'admitted' || p.state === 'waiting') out.add(p.id);
+    }
+  }
+  return [...out];
+}
 function refusals(p) {
   if (git(src, 'status', '--porcelain').trim()) die(`${src} has uncommitted work: commit first`);
   let stamp = null;
@@ -49,6 +71,8 @@ function refusals(p) {
   const tree = cp.execFileSync(path.join(here, 'bin', 'h-test'), ['--code-tree'], { cwd: src, encoding: 'utf8' }).trim();
   if (!stamp || stamp.code_tree !== tree || stamp.dirty) die('no passing full suite for this code: run bin/h-test --full');
   if (cp.spawnSync('pgrep', ['-f', 'bin/codex-driver']).status === 0) die('a Codex round is running: release when it ends');
+  const busy = inFlight();
+  if (busy.length) die(`package in flight: ${busy.join(', ')}: release when it lands`);
   const touched = new Set([...p.copy, ...p.remove]);
   const edits = git(dst, 'status', '--porcelain', '-z').split('\0').filter(Boolean).map(l => l.slice(3)).filter(f => touched.has(f));
   if (edits.length) die(`uncommitted change in ${dst}: ${edits.join(', ')}`);
