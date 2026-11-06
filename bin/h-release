@@ -1,0 +1,83 @@
+#!/usr/bin/env node
+'use strict';
+// h-release: copy this clone's code into the installed copy, so holden can be edited here while
+// other repos run on ~/.claude/holden, which changes only at a release.
+//   h-release [--dry-run] [--from DIR] [--to DIR]    default: this clone into ~/.claude/holden
+// What the installed copy records stays: .planning/, .holden/, docs/CONTEXT.md, .gitignore, and any
+// tracked file outside the code directories (observations.md, for one). A file a source lacks is
+// removed only under those directories. Each file is written beside its target and renamed over
+// it, so a script that is running keeps the old file. The commit runs under the installed copy's
+// landing lock. Refused: a dirty source, a source with no passing full suite (h-test --full), a
+// running Codex round, and an uncommitted change to a file the release would touch.
+// Exit 0 done or nothing to do, 1 refused or failed, 2 usage.
+const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process');
+
+const args = process.argv.slice(2);
+const flag = n => { const i = args.indexOf(n); return i < 0 ? null : args[i + 1]; };
+const dry = args.includes('--dry-run'), apply = args.includes('--apply');
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--from' || args[i] === '--to') { i++; if (!args[i]) { console.error(`${args[i - 1]} needs a directory`); process.exit(2); } continue; }
+  if (!['--dry-run', '--apply'].includes(args[i])) { console.error('usage: h-release [--dry-run] [--from DIR] [--to DIR]'); process.exit(2); }
+}
+const CODE = ['agents', 'bin', 'docs', 'hooks', 'lib', 'skills', 'templates', 'tests'];
+const TOP = ['DECISION.md', 'LICENSE', 'README.md'];
+const KEEP = new Set(['docs/CONTEXT.md']);
+const managed = f => !KEEP.has(f) && (TOP.includes(f) || CODE.includes(f.split('/')[0]));
+const die = m => { console.error(`h-release: ${m}`); process.exit(1); };
+const git = (dir, ...a) => cp.execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const files = dir => git(dir, 'ls-files', '-z').split('\0').filter(Boolean).filter(managed);
+
+const here = path.resolve(__dirname, '..');
+const src = fs.realpathSync(flag('--from') || here);
+let dst;
+try { dst = fs.realpathSync(flag('--to') || path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'holden')); } catch (e) { die('no installed copy: run bin/link'); }
+if (src === dst) die(`${src} is the installed copy: nothing to release into`);
+
+function plan() {
+  const want = files(src), have = new Set(files(dst));
+  const same = f => {
+    const a = path.join(src, f), b = path.join(dst, f);
+    return fs.existsSync(b) && fs.readFileSync(a).equals(fs.readFileSync(b)) && (fs.statSync(a).mode & 0o111) === (fs.statSync(b).mode & 0o111);
+  };
+  const keep = new Set(want);
+  return { copy: want.filter(f => !same(f)), remove: [...have].filter(f => !keep.has(f)).sort() };
+}
+function refusals(p) {
+  if (git(src, 'status', '--porcelain').trim()) die(`${src} has uncommitted work: commit first`);
+  let stamp = null;
+  try { stamp = JSON.parse(fs.readFileSync(path.join(src, '.holden', 'test-stamp'), 'utf8')); } catch (e) { /* no stamp */ }
+  const tree = cp.execFileSync(path.join(here, 'bin', 'h-test'), ['--code-tree'], { cwd: src, encoding: 'utf8' }).trim();
+  if (!stamp || stamp.code_tree !== tree || stamp.dirty) die('no passing full suite for this code: run bin/h-test --full');
+  if (cp.spawnSync('pgrep', ['-f', 'bin/codex-driver']).status === 0) die('a Codex round is running: release when it ends');
+  const touched = new Set([...p.copy, ...p.remove]);
+  const edits = git(dst, 'status', '--porcelain', '-z').split('\0').filter(Boolean).map(l => l.slice(3)).filter(f => touched.has(f));
+  if (edits.length) die(`uncommitted change in ${dst}: ${edits.join(', ')}`);
+}
+function write(f) {
+  const a = path.join(src, f), b = path.join(dst, f), tmp = `${b}.release.${process.pid}`;
+  fs.mkdirSync(path.dirname(b), { recursive: true });
+  fs.copyFileSync(a, tmp); fs.chmodSync(tmp, fs.statSync(a).mode); fs.renameSync(tmp, b);
+}
+function run(p) {
+  for (const f of p.copy) write(f);
+  for (const f of p.remove) fs.rmSync(path.join(dst, f));
+  const sha = git(src, 'rev-parse', '--short', 'HEAD').trim(), all = [...p.copy, ...p.remove];
+  git(dst, 'add', '-A', '--', ...all);
+  git(dst, 'commit', '-q', '-m', `release: holden ${sha}\n\n${p.copy.length} copied, ${p.remove.length} removed`);
+  console.log(`released holden ${sha} into ${dst}: ${p.copy.length} copied, ${p.remove.length} removed`);
+  if (all.some(f => /^(skills|agents|hooks)\//.test(f))) console.log('skills, agents or hooks changed: run bin/link in the installed copy if any were added or removed, and restart open sessions');
+}
+
+const p = plan();
+refusals(p);
+if (!p.copy.length && !p.remove.length) { console.log('nothing to release'); process.exit(0); }
+if (dry) {
+  for (const f of p.copy) console.log(`copy ${f}`);
+  for (const f of p.remove) console.log(`remove ${f}`);
+  console.log(`${p.copy.length} to copy, ${p.remove.length} to remove`);
+  process.exit(0);
+}
+if (apply) { run(p); process.exit(0); }
+const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const r = cp.spawnSync(path.join(here, 'bin', 'h-queue'), ['lock', '--', `${q(process.execPath)} ${q(__filename)} --apply --from ${q(src)} --to ${q(dst)}`], { cwd: dst, stdio: 'inherit' });
+process.exit(r.status === null ? 1 : r.status);

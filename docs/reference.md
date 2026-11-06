@@ -20,6 +20,25 @@ You need Linux (WSL works) with Node 22 or later, git, bash, python3, `flock`, `
 `setpriv`. Codex and tmux are optional. `bin/link` moves any GSD install aside, so read it first
 if you have one.
 
+## Releasing
+
+Run holden from one clone and edit it in another, so a change reaches your other repos only when
+you release it. `bin/link` in the installed clone sets up `~/.claude/holden`. From the clone you edit:
+
+```
+bin/h-test --full
+bin/h-release --dry-run
+bin/h-release
+```
+
+`bin/h-release` copies `agents`, `bin`, `docs`, `hooks`, `lib`, `skills`, `templates`, `tests`,
+`DECISION.md`, `LICENSE` and `README.md` into the installed copy and commits them there. It leaves
+`.planning/`, `.holden/`, `docs/CONTEXT.md`, `.gitignore` and everything else that copy records. Each
+file is renamed into place, so a running script keeps the old file. It refuses a dirty clone, code
+with no passing full suite, a running Codex round and an uncommitted change to a file it would
+touch. If skills, agents or hooks were added or removed, run `bin/link` in the installed copy, then
+restart open sessions.
+
 ## Models
 
 You choose an agent's model in one place, `models:` in `.holden/config.yaml`. There is one key
