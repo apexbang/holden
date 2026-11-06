@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+'use strict';
+// h-machine: run a command under the machine-wide test mutex (D06). Executors run every Verify
+// command through it; h-test takes the same mutex itself.
+//   h-machine run [--label <text>] -- <command...>
+// Exit: the command's exit code; 75 when the mutex stayed busy for 9 minutes (run it again:
+// neither red nor a fix attempt); 2 usage.
+const fs = require('fs'), path = require('path'), cp = require('child_process');
+const machine = require(path.join(__dirname, '..', 'lib', 'machine.js'));
+
+const argv = process.argv.slice(2), dd = argv.indexOf('--');
+const args = dd < 0 ? argv : argv.slice(0, dd), words = dd < 0 ? [] : argv.slice(dd + 1);
+const flag = name => { const i = args.indexOf(name); return i < 0 ? null : (args[i + 1] || ''); };
+function usage(code) { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 7).join('\n')); process.exit(code); }
+if (args[0] === '-h' || args[0] === '--help') usage(0);
+if (args[0] !== 'run' || !words.length) usage(2);
+// One word after -- is a shell string; several are argv, quoted as bin/h-test quotes its --scratch command.
+const shq = w => /^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`;
+const cmd = words.length === 1 ? words[0] : words.map(shq).join(' ');
+
+// D11: a run is the package's heartbeat. h-queue beat never prints and exits 0; the cap keeps a
+// stuck registry lock from holding the command back.
+cp.spawnSync(process.execPath, [path.join(__dirname, 'h-queue'), 'beat', process.cwd()], { stdio: 'ignore', timeout: 10000 });
+if (machine.held()) {
+  const r = cp.spawnSync('bash', ['-lc', cmd], { stdio: 'inherit' });
+  process.exit(r.status === null ? 1 : r.status);
+}
+process.exit(machine.acquireAndRun(['bash', '-lc', cmd], flag('--label') || 'h-machine'));

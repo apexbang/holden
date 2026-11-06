@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# detach-seen <name>: Claude has read the finished run's result and acted on it.
+R=$HOME/.claude/detached
+[ -e "$R/$1.run" ] || { echo "no run '$1'" >&2; exit 2; }
+grep -q '^EXIT ' "$R/$1.out" 2>/dev/null || { echo "'$1' has not finished; nothing to mark" >&2; exit 3; }
+touch "$R/$1.seen"; echo "marked '$1' seen"

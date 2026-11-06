@@ -1,0 +1,235 @@
+#!/usr/bin/env node
+'use strict';
+// codex-driver — one Codex turn on a private app-server that it starts and always stops.
+//
+//   codex-driver --cwd DIR --model M --effort E --minutes N --prompt FILE --out FILE
+//                [--thread ID] [--id-file FILE] [--label L] [--dry-run]
+//
+// A fresh run starts a thread; --thread resumes one by id, from any earlier server or `codex exec`.
+// The thread is read-only with approval policy never, on the thread and on the turn. --id-file gets
+// the thread id as soon as it is known. --out gets the turn's final message, and only when this
+// turn's status is completed: a turn interrupted from the TUI, or cut off at --minutes, publishes
+// nothing, since its text could be read as a finished answer.
+//
+// The operator's view is Codex's own TUI on the thread: a background tmux window inside tmux, a
+// window in the detached session `codex` outside it, closed when the round ends because the TUI
+// stays open after its server dies. A view that cannot open never fails the round; the `watch:`
+// line gives the same command by hand.
+//
+// Teardown, on every ending: interrupt a turn not seen complete, SIGTERM, SIGKILL 2 s later. The
+// SIGKILL is needed because one SIGTERM waits for a running turn. The pid is signalled, not its
+// process group: a turn's MCP servers and sandbox sit in groups of their own, and go when the
+// server is killed. The server runs under `setpriv --pdeathsig KILL`, so a driver killed outright
+// takes it along; TERM there would wait for the turn.
+//
+// Exit 0 answer written, 1 failure, 124 the wall clock ran out, 128+n a signal.
+const cp = require('child_process'), fs = require('fs'), net = require('net'), path = require('path');
+
+const BUILT_FOR = '0.166', GRACE_MS = 2000, CONNECT_MS = 30000, TMUX_MS = 3000;
+const USAGE = 'usage: codex-driver --cwd DIR --model M --effort E --minutes N --prompt FILE --out FILE [--thread ID] [--id-file FILE] [--label L] [--dry-run]';
+const say = line => { try { process.stdout.write(line + '\n'); } catch (e) {} };
+const shq = s => /^[\w@%+=:,./-]+$/.test(s) ? s : `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+class RoundEnd extends Error { constructor(code, message) { super(message); this.code = code; } }
+
+function parseArgs(argv) {
+  const o = { dry: false }, keys = { '--cwd': 'cwd', '--model': 'model', '--effort': 'effort', '--minutes': 'minutes', '--prompt': 'prompt', '--out': 'out', '--thread': 'thread', '--id-file': 'idFile', '--label': 'label' };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--dry-run') o.dry = true;
+    else if (keys[a] && i + 1 < argv.length) o[keys[a]] = argv[++i];
+    else { console.error(`bad argument: ${a}\n${USAGE}`); process.exit(1); }
+  }
+  for (const k of ['cwd', 'model', 'effort', 'minutes', 'prompt', 'out']) if (!o[k]) { console.error(`--${k} is required\n${USAGE}`); process.exit(1); }
+  o.ms = Number(o.minutes) * 60000;
+  if (!(o.ms > 0)) { console.error(`bad --minutes: ${o.minutes}`); process.exit(1); }
+  return o;
+}
+
+function onPath(name) {
+  for (const d of (process.env.PATH || '').split(':')) {
+    const f = path.join(d || '.', name);
+    try { fs.accessSync(f, fs.constants.X_OK); if (fs.statSync(f).isFile()) return f; } catch (e) {}
+  }
+  return null;
+}
+
+const threadParams = o => ({ cwd: o.cwd, sandbox: 'read-only', approvalPolicy: 'never', model: o.model, ...(o.thread ? { threadId: o.thread } : { ephemeral: false }) });
+const turnParams = (o, threadId, text) => ({
+  threadId, input: [{ type: 'text', text, text_elements: [] }], cwd: o.cwd, model: o.model, effort: o.effort,
+  approvalPolicy: 'never', sandboxPolicy: { type: 'readOnly', networkAccess: false },
+});
+const serverArgv = (codex, port) => ['--pdeathsig', 'KILL', codex, 'app-server', '--listen', `ws://127.0.0.1:${port}`];
+const watchCmd = (codex, id, port) => `${shq(codex)} resume ${id} --remote ws://127.0.0.1:${port} -c check_for_update_on_startup=false`;
+
+function dryRun(o) {
+  say(`### server: setpriv ${serverArgv('codex', '<port>').join(' ')}`);
+  say(`### ${o.thread ? 'thread/resume' : 'thread/start'}: ${JSON.stringify(threadParams(o))}`);
+  say(`### turn/start: ${JSON.stringify(turnParams(o, o.thread || '<thread>', '<prompt file>'))}`);
+  say(`### wall clock: ${o.minutes} min, then turn/interrupt and no answer`);
+}
+
+const freePort = () => new Promise((res, rej) => {
+  const s = net.createServer();
+  s.on('error', rej);
+  s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => res(port)); });
+});
+
+// A view is a nicety: every failure here is a line in the output, never a failed round. tmux runs
+// asynchronously and bounded, because a stalled tmux must hold back neither the wall clock, nor a
+// signal, nor the teardown.
+const tmux = args => new Promise(res => cp.execFile('tmux', args, { encoding: 'utf8', timeout: TMUX_MS, killSignal: 'SIGKILL' },
+  (e, stdout, stderr) => res({ status: e ? 1 : 0, stdout, stderr: stderr || (e ? e.message : '') })));
+async function openView(o, cmd) {
+  if (!onPath('tmux')) { say('view: tmux is not installed; use the watch command'); return null; }
+  const name = `codex-${o.label || 'round'}`.slice(0, 40), fmt = ['-P', '-F', '#{window_id}'];
+  const inside = !!process.env.TMUX;
+  let r = inside ? await tmux(['new-window', '-d', ...fmt, '-n', name, '-c', o.cwd, cmd])
+    : await tmux(['new-window', '-d', ...fmt, '-t', 'codex:', '-n', name, '-c', o.cwd, cmd]);
+  if (!inside && r.status !== 0) {
+    r = await tmux(['new-session', '-d', '-s', 'codex', ...fmt, '-n', name, '-c', o.cwd, cmd]);
+    // Two rounds can race to make the session; the loser takes a window in the winner's.
+    if (r.status !== 0) r = await tmux(['new-window', '-d', ...fmt, '-t', 'codex:', '-n', name, '-c', o.cwd, cmd]);
+  }
+  if (r.status !== 0) { say(`view: tmux refused (${String(r.stderr).trim()}); use the watch command`); return null; }
+  const id = String(r.stdout).trim();
+  say(inside ? `view: tmux window ${id} (${name})` : `view: tmux attach -t codex (window ${id})`);
+  return id;
+}
+
+function finalMessage(turn, items) {
+  const texts = [...(turn.items || []), ...items].filter(i => i && i.type === 'agentMessage' && i.phase === 'final_answer' && i.text).map(i => i.text);
+  return texts.length ? texts[texts.length - 1] : '';
+}
+
+async function main() {
+  const o = parseArgs(process.argv.slice(2));
+  if (o.dry) return dryRun(o);
+  if (typeof WebSocket !== 'function') { console.error(`node ${process.version} has no global WebSocket; codex-driver needs Node 22`); process.exit(1); }
+  if (!onPath('setpriv')) { console.error('setpriv is not on PATH: the server could outlive a killed driver, so no round runs'); process.exit(1); }
+  const codex = onPath('codex');
+  if (!codex) { console.error('codex CLI not on PATH (npm i -g @openai/codex)'); process.exit(1); }
+  const prompt = fs.readFileSync(o.prompt, 'utf8');
+
+  let abort; const ended = new Promise((_, rej) => { abort = rej; });
+  ended.catch(() => {});
+  const clock = setTimeout(() => abort(new RoundEnd(124, `wall clock of ${o.minutes} min ran out, no answer published`)), o.ms);
+  for (const [sig, n] of [['SIGINT', 2], ['SIGTERM', 15], ['SIGHUP', 1]]) process.on(sig, () => abort(new RoundEnd(128 + n, `${sig}, no answer published`)));
+  process.on('uncaughtException', e => abort(new RoundEnd(1, e.stack || String(e))));
+
+  const port = await freePort();
+  const server = cp.spawn('setpriv', serverArgv(codex, port), { cwd: o.cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+  let tail = '', gone = false; const goneWaiters = [];
+  const keep = b => { tail = (tail + b).slice(-2000); };
+  server.stdout.on('data', keep); server.stderr.on('data', keep);
+  server.on('error', e => abort(new RoundEnd(1, `could not start the server: ${e.message}`)));
+  server.on('exit', (code, sig) => {
+    gone = true; for (const w of goneWaiters) w();
+    abort(new RoundEnd(1, `the server exited (${sig || code}), no answer published${tail ? '\n' + tail.trim() : ''}`));
+  });
+  const serverGone = ms => new Promise(res => {
+    if (gone) return res(true);
+    const t = setTimeout(() => res(false), ms);
+    goneWaiters.push(() => { clearTimeout(t); res(true); });
+  });
+  say(`codex server: pid ${server.pid} ws://127.0.0.1:${port}`);
+
+  let ws = null, threadId = o.thread || null, turnId = null, opening = null, turnStarting = false, turnDone = false, nextId = 0;
+  const pending = new Map(), completions = new Map(), items = [];
+  let turnWaiter = null;
+  const key = (t, u) => `${t}/${u}`;
+  const send = obj => ws.send(JSON.stringify(obj));
+  const rpc = (method, params) => new Promise((res, rej) => { const id = ++nextId; pending.set(id, { method, res, rej }); send({ id, method, params }); });
+
+  function onMessage(ev) {
+    const m = JSON.parse(ev.data);
+    if (m.id !== undefined && m.method) {  // approval policy never: a request back has no one to answer it
+      say(`server request declined: ${m.method}`);
+      send({ id: m.id, error: { code: -32601, message: 'codex-driver answers no requests' } });
+    } else if (m.id !== undefined) {
+      const p = pending.get(m.id); pending.delete(m.id);
+      if (p) m.error ? p.rej(new RoundEnd(1, `${p.method} failed: ${JSON.stringify(m.error)}`)) : p.res(m.result);
+    } else if (m.method === 'turn/started') {
+      // The first turn on this thread after turn/start went out is this round's; its id can get here
+      // before the reply does, and the teardown needs it to interrupt.
+      if (turnStarting && !turnId && m.params.threadId === threadId) turnId = m.params.turn.id;
+    } else if (m.method === 'turn/completed') {
+      // Kept by thread and turn: the server's own threads report here too, and this turn's end can
+      // arrive before turn/start's reply names it.
+      completions.set(key(m.params.threadId, m.params.turn.id), m.params.turn);
+      if (turnWaiter) turnWaiter();
+    } else if (m.method === 'item/completed' && m.params.item?.type === 'agentMessage') {
+      items.push({ ...m.params.item, threadId: m.params.threadId, turnId: m.params.turnId });
+    }
+  }
+
+  async function connect() {
+    const url = `ws://127.0.0.1:${port}`, start = Date.now();
+    for (;;) {
+      if (gone) throw new RoundEnd(1, 'the server exited before it listened');
+      try {
+        const c = new WebSocket(url);
+        await new Promise((res, rej) => { c.onopen = res; c.onerror = () => rej(new Error('no connection')); });
+        c.onerror = null;
+        return c;
+      } catch (e) {
+        if (Date.now() - start > CONNECT_MS) throw new RoundEnd(1, `no server on ${url} after ${CONNECT_MS / 1000} s`);
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }
+  }
+
+  async function body() {
+    ws = await connect();
+    ws.onmessage = onMessage;
+    ws.onclose = () => { ws = null; abort(new RoundEnd(1, 'the connection to the server dropped, no answer published')); };
+    const init = await rpc('initialize', { clientInfo: { name: 'holden', version: '1' } });
+    const v = (String(init.userAgent).match(/\/(\d+\.\d+)\./) || [])[1];
+    if (v !== BUILT_FOR) say(`warning: codex ${v || 'of unknown version'} runs here, this driver was built against ${BUILT_FOR}`);
+    send({ method: 'initialized' });
+    const t = await rpc(o.thread ? 'thread/resume' : 'thread/start', threadParams(o));
+    if (o.thread && t.thread.id !== o.thread) throw new RoundEnd(1, `resumed thread '${t.thread.id}', not ${o.thread}; no answer published`);
+    threadId = t.thread.id;
+    if (!threadId) throw new RoundEnd(1, 'no thread id from the server, no answer published');
+    if (o.idFile) fs.writeFileSync(o.idFile, threadId + '\n');
+    say(`thread: ${threadId}`);
+    turnStarting = true;
+    const r = await rpc('turn/start', turnParams(o, threadId, prompt));
+    turnId = r.turn.id;
+    const cmd = watchCmd(codex, threadId, port);
+    say(`watch: ${cmd}`);
+    opening = openView(o, cmd);
+    const done = await new Promise(res => {
+      const check = () => { const c = completions.get(key(threadId, turnId)); if (c) res(c); };
+      turnWaiter = check; check();
+    });
+    turnDone = true;
+    if (done.status !== 'completed') throw new RoundEnd(1, `the turn ended ${done.status}${done.error ? ': ' + JSON.stringify(done.error) : ''}, no answer published`);
+    const text = finalMessage(done, items.filter(i => i.threadId === threadId && i.turnId === turnId));
+    if (!text) throw new RoundEnd(1, 'the turn completed with no final message, no answer published');
+    fs.writeFileSync(o.out, text.endsWith('\n') ? text : text + '\n');
+  }
+
+  async function teardown() {
+    clearTimeout(clock);
+    if (ws && turnId && !turnDone) try { send({ id: ++nextId, method: 'turn/interrupt', params: { threadId, turnId } }); } catch (e) {}
+    if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} }
+    if (!gone) {
+      server.kill('SIGTERM');
+      if (!await serverGone(GRACE_MS)) { server.kill('SIGKILL'); await serverGone(GRACE_MS); }
+    }
+    // Last, so that nothing tmux does can stand between a round and its server stopping.
+    const view = await opening;
+    if (view) await tmux(['kill-window', '-t', view]);
+  }
+
+  let code = 0;
+  try { await Promise.race([body(), ended]); } catch (e) {
+    code = e instanceof RoundEnd ? e.code : 1;
+    console.error(e instanceof RoundEnd ? e.message : (e.stack || String(e)));
+  }
+  await teardown();
+  process.exit(code);
+}
+
+main().catch(e => { console.error(e.stack || String(e)); process.exit(1); });

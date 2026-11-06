@@ -1,0 +1,57 @@
+# .holden/config.yaml — per-repo knobs. Everything else is global.
+# holden runs on itself; the founding record is DECISION.md D01-D37.
+holden: 1
+parallel_waves: false      # self-hosting: a landing changes the live tooling
+models:                    # haiku | sonnet | opus | fable | inherit; inherit = the session model capped at Opus
+  researcher: inherit
+  planner: inherit
+  executor: sonnet
+  reviewer: inherit
+  tracer: sonnet
+  auditor_map: haiku
+  auditor: sonnet
+  verifier: opus
+review:
+  plan_tier: self          # none | self | codex; the plan review is where Codex pays off
+  diff_tier: self          # none | self | codex; the diff review after the last plan lands
+  codex_paths:             # a phase touching any of these defaults its plan tier to codex: branch, lock and proof code
+    - "bin/h-worktree"
+    - "bin/h-test"
+    - "bin/h-plans"
+    - "lib/worktrees.js"
+    - "hooks/**"
+  diff_axes: one
+tests:
+  test_file_patterns:
+    - "tests/**"
+  fixture_patterns:
+    - "**/fixtures/**"
+    - "**/__snapshots__/**"
+  targeted:
+    - match: "tests/**/*.test.js"
+      run: "node --test {files}"
+  worktree_setup: []       # no dependencies to borrow
+  full:
+    - "node --test"        # Node's default patterns find tests/**/*.test.js; zero tests exit 0
+  deps: []
+  summary: []
+  missing_name: []
+  single_test_db: false
+  stamp_ignore:            # paths that cannot change what a node test of bin/ and lib/ sees
+    - ".planning/**"
+    - ".holden/**"
+    - "docs/**"
+    - "**/*.md"
+    - "!templates/**"      # tests may parse the templates
+    - "*.log"
+worktrees:
+  smoke: null
+  max: 3
+deploy: null               # no deploy: ~/.claude links to this checkout through bin/link
+prod_read: null
+paths:
+  phases: .planning/phases
+  archive: .planning/archive
+  quick: .planning/quick
+  traces: .planning/traces
+  audits: .planning/audits

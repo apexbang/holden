@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# codex-ask — one consult: a question to Codex, or a follow-up in the same Codex conversation.
+#
+#   codex-ask [--sheet] [--slug S] [--model M] [--effort E] [--dry-run] --file Q.md   a fresh question
+#   codex-ask --continue S [--model M] [--effort E] [--dry-run] --file Q.md   a follow-up
+#
+# A fresh question runs gpt-6-sol at effort medium for 15 minutes; --sheet (a grill's answer
+# sheet) at effort high for 25 minutes, and sends the format in templates/answer-sheet.md.
+# A follow-up resumes the conversation by the id in its session file, never --last, with that
+# file's model, effort and minutes, from the root the first call ran in; --model and --effort
+# override for one round.
+# Records go to the main checkout's .holden/codex-ask/<S>/: Q-r<N>.md (the prompt as sent),
+# A-r<N>.md (Codex's answer), session (id, model, effort, minutes, root). Rounds count up and no
+# file is overwritten; a round whose run failed keeps its Q file and gets no A file.
+# S is --slug, or the date and the question's first six words; a made slug that exists takes -2,
+# -3, ...; a given slug that exists is refused (exit 2): a follow-up is --continue S.
+# A round runs through codex-driver: a thread on a private app-server, which the operator can watch.
+# Bounds: read-only sandbox, a wall clock past which nothing is published, no test suites. Codex may
+# end with a thread it proposes to follow or with questions back; the caller decides (skills/h-ask).
+# Exits 5 without running Codex when codex-limits --check is not ok. CODEX_ASK_SKIP_LIMITS=1 skips
+# the gate by hand; CODEX_ASK_LIMITS names another limits command.
+# Exit 0 published, 1 usage or failure, 2 the slug exists, 5 Codex unavailable. A failed round
+# exits 1 and names codex-driver's exit code.
+set -euo pipefail
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0"; exit "${1:-0}"; }
+need() { [[ $# -ge 2 && -n "$2" ]] || { echo "$1 needs a value" >&2; usage 1; }; }
+[[ $# -ge 1 ]] || usage 1
+
+SHEET=0; SLUG=""; CONT=""; MODEL=""; EFFORT=""; FILE=""; DRY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sheet)    SHEET=1; shift ;;
+    --slug)     need "$@"; SLUG="$2"; shift 2 ;;
+    --continue) need "$@"; CONT="$2"; shift 2 ;;
+    --model)    need "$@"; MODEL="$2"; shift 2 ;;
+    --effort)   need "$@"; EFFORT="$2"; shift 2 ;;
+    --file)     need "$@"; FILE="$2"; shift 2 ;;
+    --dry-run)  DRY=1; shift ;;
+    -h|--help)  usage 0 ;;
+    *) echo "unknown argument: $1" >&2; usage 1 ;;
+  esac
+done
+
+SLUG_RE='^[a-z0-9][a-z0-9._-]*$'
+ID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{7,}$'
+[[ -n "$FILE" ]] || { echo "--file Q.md is required" >&2; usage 1; }
+if [[ -n "$CONT" ]] && { [[ -n "$SLUG" ]] || (( SHEET )); }; then echo "--continue takes no --slug or --sheet" >&2; usage 1; fi
+for s in "$SLUG" "$CONT"; do
+  [[ -z "$s" || "$s" =~ $SLUG_RE ]] || { echo "bad slug '$s': lower-case letters, digits, '.', '_' and '-', starting with a letter or digit" >&2; exit 1; }
+done
+[[ -z "$MODEL" || "$MODEL" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad --model: $MODEL" >&2; exit 1; }
+[[ -z "$EFFORT" || "$EFFORT" =~ ^[a-z]+$ ]] || { echo "bad --effort: $EFFORT" >&2; exit 1; }
+[[ -f "$FILE" ]] && grep -q '[^[:space:]]' "$FILE" || { echo "no question in $FILE (missing or empty)" >&2; exit 1; }
+FILE="$(readlink -f -- "$FILE")"
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "codex-ask runs inside a git repository" >&2; exit 1; }
+BASE="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.holden/codex-ask"
+command -v codex >/dev/null || { echo "codex CLI not on PATH (npm i -g @openai/codex)" >&2; exit 1; }
+HERE="$(dirname "$(readlink -f "$0")")"
+LIMITS="${CODEX_ASK_LIMITS:-$HERE/codex-limits}"
+
+words() {  # the question's first six words, lower-case a-z0-9, joined by '-'
+  awk '{ for (i = 1; i <= NF && n < 6; i++) { w = tolower($i); gsub(/[^a-z0-9]/, "", w); if (w != "") out = out (n++ ? "-" : "") w } }
+       END { print (out == "" ? "consult" : out) }' "$1"
+}
+
+if [[ -n "$CONT" ]]; then
+  SLUG="$CONT"; DIR="$BASE/$SLUG"
+  [[ -d "$DIR" ]] || { echo "no consult '$SLUG' under $BASE" >&2; exit 1; }
+  [[ -f "$DIR/session" ]] || { echo "'$SLUG' has no session file: its first call did not finish; ask a fresh question" >&2; exit 1; }
+  field() { awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$DIR/session"; }
+  bad() { echo "unreadable session file $DIR/session: $1" >&2; exit 1; }
+  ID="$(field id)"; SMODEL="$(field model)"; SEFFORT="$(field effort)"; MINUTES="$(field minutes)"; RUNROOT="$(field root)"
+  [[ "$ID" =~ $ID_RE ]] || bad "id '$ID'"
+  [[ "$SMODEL" =~ ^[A-Za-z0-9._-]+$ ]] || bad "model '$SMODEL'"
+  [[ "$SEFFORT" =~ ^[a-z]+$ ]] || bad "effort '$SEFFORT'"
+  [[ "$MINUTES" =~ ^[1-9][0-9]*$ ]] || bad "minutes '$MINUTES'"
+  [[ "$RUNROOT" == /* && -d "$RUNROOT" ]] || bad "root '$RUNROOT' is not a directory"
+  MODEL="${MODEL:-$SMODEL}"; EFFORT="${EFFORT:-$SEFFORT}"
+else
+  if (( SHEET )); then EFFORT="${EFFORT:-high}"; MINUTES=25; else EFFORT="${EFFORT:-medium}"; MINUTES=15; fi
+  MODEL="${MODEL:-gpt-6-sol}"; RUNROOT="$ROOT"
+  if [[ -n "$SLUG" ]]; then
+    GIVEN=1
+    [[ ! -e "$BASE/$SLUG" ]] || { echo "refusing: consult '$SLUG' exists; a follow-up is --continue $SLUG" >&2; exit 2; }
+  else
+    GIVEN=0; SLUG="$(date +%F)-$(words "$FILE")"
+  fi
+fi
+
+bounds() { cat <<B
+## You may explore
+You are in a READ-ONLY sandbox at the repository root. Use rg / sed -n / cat / git log / git diff freely.
+You have about ${MINUTES} minutes of wall clock; the round is cut off at the limit and nothing you wrote
+is kept, so write your answer before you run out. Do not run test suites. If you cannot verify a claim,
+say "could not verify" and move on.
+
+## After your answer
+Answer what you were asked first. Then, only if you have one:
+- a thread beyond the question that is worth following: end with a "## Thread to follow" section saying,
+  in your own words, what it is and why. Do not follow it yet; the session reading this decides, and a
+  yes comes back to you in this conversation.
+- something only the asker can settle: end with a "## Questions back" section.
+B
+}
+if [[ -n "$CONT" ]]; then
+  PROMPT="$(cat "$FILE")"
+elif (( SHEET )); then
+  TPL="$HERE/../templates/answer-sheet.md"; [[ -s "$TPL" ]] || { echo "missing $TPL" >&2; exit 1; }
+  PROMPT="$(cat <<P
+You are answering a design interview's decision list for the repository you are in. Someone else
+gathered the list, its facts and each decision's prerequisites. Answer each decision under
+## Decisions, in order, from those facts and the code. When a decision lists options, choose
+from them. Read ## Settled as context: answer none of it, and add no decisions.
+
+$(bounds)
+
+## Answer in this shape
+$(cat "$TPL")
+
+## The decision list
+$(cat "$FILE")
+P
+)"
+else
+  PROMPT="$(cat <<P
+You are consulted on one question about the repository you are in. Give your own answer, from the
+code and the facts the question cites.
+
+$(bounds)
+
+## Answer in this shape
+1. The answer, in one or two sentences.
+2. The options you weighed, each with its trade-offs.
+3. Your pick, and your confidence in it: high, medium or low.
+4. The path:line or URL each claim rests on.
+There is no length limit.
+
+## The question
+$(cat "$FILE")
+P
+)"
+fi
+
+next_round() {  # one past the highest round of a Q-r<N>.md or A-r<N>.md in $DIR
+  local n=0 f m
+  for f in "$DIR"/[QA]-r*.md; do
+    [[ -e "$f" ]] || continue
+    m="${f##*-r}"; m="${m%.md}"
+    if [[ "$m" =~ ^[0-9]+$ ]] && (( 10#$m > n )); then n=$((10#$m)); fi
+  done
+  echo $((n + 1))
+}
+build_cmd() {  # the driver's answer and id files sit outside the slug folder, so a killed run leaves nothing in it
+  WORK="$BASE/.work/$SLUG-r$N.$$"; OUT="$WORK/answer.md"
+  DRIVER=("$HERE/codex-driver" --cwd "$RUNROOT" --model "$MODEL" --effort "$EFFORT" --minutes "$MINUTES" --prompt "$DIR/Q-r$N.md" --out "$OUT" --id-file "$WORK/thread" --label "ask-r$N")
+  [[ -z "$CONT" ]] || DRIVER+=(--thread "$ID")
+}
+
+if (( DRY )); then
+  if [[ -z "$CONT" ]]; then
+    S="$SLUG"; k=1; while [[ -e "$BASE/$S" ]]; do k=$((k + 1)); S="$SLUG-$k"; done; SLUG="$S"; DIR="$BASE/$SLUG"; N=1
+  else N="$(next_round)"; fi
+  build_cmd
+  echo "### would run, in $RUNROOT:"; "${DRIVER[@]}" --dry-run
+  echo "### records: $DIR/Q-r$N.md, $DIR/A-r$N.md"
+  echo "### prompt:"; printf '%s\n' "$PROMPT"
+  exit 0
+fi
+
+# Gate: a spent window, a lapsed plan or an unreadable account refuses before any folder or round is made.
+if [[ "${CODEX_ASK_SKIP_LIMITS:-0}" != 1 ]]; then
+  set +e; verdict="$("$LIMITS" --check 2>/dev/null)"; vrc=$?; set -e
+  verdict="${verdict:-unreadable: no output}"
+  echo "codex limits before: $verdict"
+  if (( vrc != 0 )); then echo "codex unavailable (${verdict%%:*}), no consult run" >&2; exit 5; fi
+else
+  echo "codex limits before: $("$LIMITS" 2>&1 || true)"
+fi
+
+if [[ -z "$CONT" ]]; then
+  mkdir -p "$BASE"
+  if (( GIVEN )); then
+    mkdir "$BASE/$SLUG" 2>/dev/null || { echo "refusing: consult '$SLUG' exists; a follow-up is --continue $SLUG" >&2; exit 2; }
+  else
+    stem="$SLUG"; k=1
+    until mkdir "$BASE/$SLUG" 2>/dev/null; do
+      [[ -e "$BASE/$SLUG" ]] || { echo "cannot make a consult folder $BASE/$SLUG" >&2; exit 1; }
+      k=$((k + 1)); SLUG="$stem-$k"
+    done
+  fi
+  DIR="$BASE/$SLUG"
+fi
+N="$(next_round)"
+until ( set -o noclobber; printf '%s\n' "$PROMPT" > "$DIR/Q-r$N.md" ) 2>/dev/null; do
+  [[ -e "$DIR/Q-r$N.md" ]] || { echo "cannot write $DIR/Q-r$N.md" >&2; exit 1; }
+  N=$((N + 1))
+done
+build_cmd
+mkdir -p "$WORK"; trap 'rm -rf "$WORK"' EXIT
+echo "[$(date -Is)] consult $SLUG round $N: model=$MODEL effort=$EFFORT minutes=$MINUTES"
+# The death signal stops the driver, and with it the server, when this script is killed: bash runs no trap for that.
+set +e; setpriv --pdeathsig TERM "${DRIVER[@]}"; rc=$?; set -e
+echo "[$(date -Is)] exit=$rc"
+echo "codex limits after: $("$LIMITS" 2>&1 || true)"
+if (( rc != 0 )); then echo "codex failed (exit $rc), no answer published; $DIR/Q-r$N.md stays as sent" >&2; exit 1; fi
+[[ -s "$OUT" ]] || { echo "codex exited 0 but wrote no answer, none published" >&2; exit 1; }
+TID="$(cat "$WORK/thread" 2>/dev/null || true)"
+if [[ -z "$CONT" ]]; then
+  [[ "$TID" =~ $ID_RE ]] || { echo "no thread id from the driver ('$TID'); no answer published, nothing to continue" >&2; exit 1; }
+  ( set -o noclobber; printf 'id=%s\nmodel=%s\neffort=%s\nminutes=%s\nroot=%s\n' "$TID" "$MODEL" "$EFFORT" "$MINUTES" "$RUNROOT" > "$DIR/session" )
+fi
+ln -- "$OUT" "$DIR/A-r$N.md" 2>/dev/null || { echo "refusing: $DIR/A-r$N.md exists" >&2; exit 1; }
+echo "answer: $DIR/A-r$N.md"
+echo "slug: $SLUG round $N"

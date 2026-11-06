@@ -1,0 +1,423 @@
+#!/usr/bin/env node
+'use strict';
+// h-radius: who reads a hub. Whatever reads it without the ledger's knowledge reads it without
+// consent, so every hub gets three lists: found by search, found in the map, claimed absent.
+//   h-radius <hub>...            hub = a symbol (function, column, setting key, event, route) or a tracked path
+//   h-radius --check-refs [<files>...]   comment path references (every line of a .md file named): ok, moved, deleted
+//   h-radius --check-map                 every .holden/radius.yaml entry resolves to a file and a function
+//   h-radius --check-ids [--range <a>..<b>] [<files>...]   planning ids in the comments, docstrings and test names a change adds
+// Search covers every tracked file except .planning, .holden, lock and generated files, and *.md other than
+// docs/integration-points.md; *.md files that name the hub are listed apart as docs naming it.
+// The map (.holden/radius.yaml) holds the readers grep cannot find.
+// Exit 0 always for a search; 1 when --check-refs or --check-map found a dead reference, or --check-ids found an id; 2 = usage.
+const fs = require('fs'), path = require('path'), cp = require('child_process');
+const yaml = require(path.join(__dirname, '..', 'lib', 'yaml-lite.js'));
+const { CODE_SPEC, escRe, globToRe, grepFiles, importers } = require(path.join(__dirname, '..', 'lib', 'importers.js'));
+
+const args = process.argv.slice(2);
+const HELP = (() => { const ls = fs.readFileSync(__filename, 'utf8').split('\n').slice(2); return ls.slice(0, ls.findIndex(l => !l.startsWith('//'))).join('\n'); })();
+const USAGE = 'usage: h-radius <hub>... | --check-refs [<files>...] | --check-map | --check-ids [--range <a>..<b>] [<files>...]';
+const opt = { hubs: [], checkRefs: false, checkMap: false, checkIds: false, range: undefined, since: '1.year' };
+let rangeSeen = false;
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '--check-refs') opt.checkRefs = true;
+  else if (a === '--check-map') opt.checkMap = true;
+  else if (a === '--check-ids') opt.checkIds = true;
+  else if (a === '--range') { rangeSeen = true; opt.range = args[++i]; }
+  else if (a === '--since') opt.since = args[++i];
+  else if (a === '-h' || a === '--help') { console.log(HELP); process.exit(0); }
+  else if (a.startsWith('--')) { console.error('unknown flag ' + a); process.exit(2); }
+  else opt.hubs.push(a);
+}
+if (!opt.hubs.length && !opt.checkRefs && !opt.checkMap && !opt.checkIds) { console.error(USAGE); process.exit(2); }
+if (rangeSeen && (!opt.checkIds || !opt.range || !opt.range.includes('..'))) { console.error(USAGE); process.exit(2); }
+
+function sh(cmd, o = {}) { try { return cp.execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1 << 28, ...o }).replace(/\n$/, ''); } catch (e) { return ''; } }
+function gitGrep(flags, pattern, pathspecs) { const r = cp.spawnSync('git', ['grep', ...flags, '-e', pattern, '--', ...pathspecs], { encoding: 'utf8', maxBuffer: 1 << 28 }); return (r.stdout || '').replace(/\n$/, ''); }
+const root = sh('git rev-parse --show-toplevel');
+if (!root) { console.error('not a git repository'); process.exit(2); }
+process.chdir(root);
+const cfgPath = path.join(root, '.holden', 'config.yaml');
+const cfg = fs.existsSync(cfgPath) ? yaml.load(cfgPath) : yaml.load(path.join(__dirname, '..', 'templates', 'config.yaml'));
+const testPatterns = (cfg.tests || {}).test_file_patterns || ['tests/**'];
+const isTest = f => testPatterns.some(p => globToRe(p).test(f));
+const INTEGRATION = 'docs/integration-points.md';
+const SKIP = /^(\.planning|\.holden|node_modules|dist|build|vendor)\/|\/(node_modules|dist|build|vendor)\/|\.(lock|min\.js|map|svg|png|jpg|ico|woff2?)$|package-lock\.json$/;
+const tracked = sh('git ls-files').split('\n').filter(Boolean);
+const searchable = tracked.filter(f => !SKIP.test(f) && (!f.endsWith('.md') || f === INTEGRATION));
+const searchableSet = new Set(searchable);
+const out = [];
+function log(m) { out.push(m); }
+
+// --- the map: .holden/radius.yaml, readers grep cannot find -------------------------------------
+const mapPath = path.join(root, '.holden', 'radius.yaml');
+const map = fs.existsSync(mapPath) ? (yaml.load(mapPath).hubs || []) : [];
+function functionPresent(file, fn) {
+  if (!fn || fn === '-' ) return true;
+  const text = fs.readFileSync(file, 'utf8');
+  return new RegExp('\\b' + fn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(text);
+}
+function mapEntries(hub) {
+  const res = [];
+  for (const h of map) {
+    if (!h || h.hub !== hub) continue;
+    for (const r of (h.readers || [])) {
+      const file = r.path || '';
+      const exists = fs.existsSync(path.join(root, file));
+      const dead = !exists ? 'DEAD: file missing' : (!functionPresent(file, r.function) ? `DEAD: no "${r.function}" in file` : null);
+      res.push({ ...r, dead });
+    }
+  }
+  return res;
+}
+function fmtMap(r) { return `${r.path}${r.function ? ' ' + r.function : ''} — ${r.when || 'no condition given'}${r.phase ? ` (${r.phase})` : ''}${r.dead ? '  <- ' + r.dead : ''}`; }
+
+// --- search --------------------------------------------------------------------------------------
+function grepHits(sym) {
+  const esc = sym.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const raw = gitGrep(['-n', '-I', '-E'], `(^|[^A-Za-z0-9_])${esc}([^A-Za-z0-9_]|$)`, CODE_SPEC);
+  const byFile = new Map();
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    const m = line.match(/^([^:]+):(\d+):(.*)$/); if (!m) continue;
+    const f = m[1]; if (!byFile.has(f)) byFile.set(f, []);
+    byFile.get(f).push({ line: +m[2], text: m[3].trim() });
+  }
+  return byFile;
+}
+function coChanged(file) {
+  const hashes = sh(`git log --since=${opt.since} --format=%h -- '${file}'`).split('\n').filter(Boolean).slice(0, 200);
+  if (!hashes.length) return { commits: 0, files: [] };
+  const counts = new Map();
+  for (const h of hashes) for (const f of sh(`git show --name-only --format= ${h}`).split('\n')) { if (f && f !== file && searchableSet.has(f)) counts.set(f, (counts.get(f) || 0) + 1); }
+  const files = [...counts.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  return { commits: hashes.length, files };
+}
+// A language that imports a directory rather than a file (Go packages, a JS index file) is searched
+// apart by directory; lib/importers.js importers finds the file imports.
+function dirImporters(file, already) {
+  const dir = path.dirname(file);
+  if (dir === '.') return new Map();
+  const found = grepFiles(`['"]([^'"]*/)?${escRe(dir)}['"]|['"][^'"]*/${escRe(path.basename(dir))}['"]`, file);
+  for (const f of [...found.keys()]) if (already.has(f) || path.dirname(f) === dir) found.delete(f);
+  return found;
+}
+
+function radius(hub) {
+  const isFile = searchableSet.has(hub) || tracked.includes(hub);
+  log(`## ${hub}${isFile ? ' (file)' : ''}`);
+  log('### found by search');
+  const absent = [];
+  if (isFile) {
+    const imp = importers(hub);
+    const tests = [...imp.keys()].filter(isTest), code = [...imp.keys()].filter(f => !isTest(f));
+    if (code.length) { log('- importers:'); for (const f of code) log(`  - ${f} (${imp.get(f)})`); } else absent.push('importers');
+    const dimp = dirImporters(hub, imp);
+    if (dimp.size) { log(`- importers of its directory \`${path.dirname(hub)}\` (a package import, as in Go, or an index file; check each):`); for (const [f, n] of [...dimp.entries()].slice(0, 20)) log(`  - ${f} (${n})`); if (dimp.size > 20) log(`  - … ${dimp.size - 20} more`); }
+    if (tests.length) { log('- tests naming it:'); for (const f of tests) log(`  - ${f}`); } else absent.push('tests');
+    const co = coChanged(hub);
+    if (co.files.length) { log(`- co-changed in ${co.commits} commits since ${opt.since} (>=2 times):`); for (const [f, n] of co.files) log(`  - ${f} (${n})`); } else absent.push(`co-changed files (${co.commits} commits since ${opt.since})`);
+  } else {
+    const hits = grepHits(hub);
+    const files = [...hits.keys()];
+    const code = files.filter(f => !isTest(f) && f !== INTEGRATION), tests = files.filter(isTest);
+    const bySql = code.filter(f => /\.sql$|migrations?\//.test(f)), rest = code.filter(f => !bySql.includes(f));
+    if (rest.length) { log('- readers:'); for (const f of rest) { const h = hits.get(f); log(`  - ${f} (${h.length}): ${h.slice(0, 3).map(x => x.line).join(', ')}${h.length > 3 ? ', …' : ''}`); } } else absent.push('code readers');
+    if (bySql.length) { log('- SQL and migrations:'); for (const f of bySql) log(`  - ${f} (${hits.get(f).length})`); } else absent.push('SQL and migrations');
+    if (tests.length) { log('- tests naming it:'); for (const f of tests) log(`  - ${f} (${hits.get(f).length})`); } else absent.push('tests');
+    // A client that builds the URL from a template string (`/items/${uid}/copy`) never
+    // contains the full route, so a route hub is also searched by its last static segment
+    // (a route was missed that way).
+    if (hub.includes('/')) {
+      const seg = hub.split('/').filter(p => p && !/^[<:{]/.test(p)).pop();
+      if (seg && seg.length >= 3 && seg !== hub) {
+        const extra = [...grepHits(seg).entries()].filter(([f]) => !hits.has(f) && f !== INTEGRATION && !isTest(f));
+        if (extra.length) { log(`- by the route's last segment \`${seg}\` (check each; a template-string URL hides its callers):`); for (const [f, h] of extra.slice(0, 15)) log(`  - ${f} (${h.length}): ${h.slice(0, 3).map(x => x.line).join(', ')}`); if (extra.length > 15) log(`  - … ${extra.length - 15} more`); }
+      }
+    }
+  }
+  const integ = searchableSet.has(INTEGRATION) ? gitGrep(['-n', '-I', '-F'], hub, [INTEGRATION]).split('\n').filter(Boolean) : [];
+  if (integ.length) { log(`- ${INTEGRATION}:`); for (const l of integ) log(`  - line ${l.split(':')[1]}: ${l.split(':').slice(2).join(':').trim().slice(0, 120)}`); } else absent.push('integration-points entries');
+  // A doc that names the hub goes stale when the hub moves or changes shape (a
+  // spec's pointers into a moved builder), and the search above skips *.md.
+  const docs = gitGrep(['-c', '-I', '-F'], hub, ['*.md', ':!.planning', ':!.holden', ':!' + INTEGRATION, ':!**/node_modules/**']).split('\n').filter(Boolean);
+  if (docs.length) { log('- docs naming it:'); for (const l of docs) log(`  - ${l.replace(/:(\d+)$/, ' ($1)')}`); } else absent.push('docs naming it');
+  log('### found in the map');
+  const entries = mapEntries(hub);
+  if (entries.length) for (const r of entries) log(`- ${fmtMap(r)}`); else log('- none');
+  log('### claimed absent');
+  log(absent.length ? `- no ${absent.join('; no ')}` : '- nothing: every kind of reader had a hit');
+  if (!entries.length && absent.length) log('- (a reader the search cannot see is a map entry, not an absence; the map has none for this hub)');
+  log('');
+  return entries.some(r => r.dead);
+}
+
+// --- comment references -------------------------------------------------------------------------
+// Comment markers of any language: # (Python, shell, YAML), // /// //! (C family, Go, Rust, JS), * and
+// /* /** (block comments), -- (SQL, Lua, Haskell), ; (Lisp, assembly, INI).
+const COMMENT = /^\s*(#+|\/\/[\/!]?|\*|\/\*\*?|--|;+)\s/;
+// A reference ends in an extension some tracked file carries, or a common source extension: a
+// repo that moved off a language still has comments naming files in it (a dropped
+// Python service, say), and a comment may name a sibling repo's file.
+const COMMON_EXTS = 'py js jsx ts tsx mjs cjs svelte vue go rs c h cc cpp hpp java kt swift rb php sh sql yaml yml toml json md'.split(' ');
+const EXTS = [...new Set([...COMMON_EXTS, ...tracked.map(f => (path.basename(f).match(/\.([A-Za-z0-9]{1,6})$/) || [])[1]).filter(Boolean)])].sort((a, b) => b.length - a.length);
+const PATHREF = new RegExp(`(?<![\\w\\/.])(\\.?[A-Za-z_][\\w\\-]*(?:\\/[\\w\\-.]+)+\\.(?:${EXTS.map(escRe).join('|') || 'md'}))\\b`, 'g');
+function checkRefs(files) {
+  const byBase = new Map();
+  for (const f of tracked) { const b = path.basename(f); if (!byBase.has(b)) byBase.set(b, []); byBase.get(b).push(f); }
+  // With no files named: every searchable text file (git's own binary test) holding a slash, in
+  // any language; a file over 1 MB is data, not code with comments. A fixed string, because a
+  // path-shaped regex backtracks for minutes on long lines.
+  const targets = files.length ? files : gitGrep(['-l', '-I', '-F'], '/', CODE_SPEC).split('\n').filter(f => f && fs.statSync(f).size < 1 << 20);
+  let dead = 0, moved = 0, ok = 0;
+  const lines = [];
+  for (const f of targets) {
+    if (!fs.existsSync(f)) continue;
+    const text = fs.readFileSync(f, 'utf8').split('\n');
+    const isDoc = f.endsWith('.md');
+    text.forEach((line, i) => {
+      if (!isDoc && !COMMENT.test(line)) return;
+      for (const m of line.matchAll(PATHREF)) {
+        const ref = m[1];
+        if (fs.existsSync(path.join(root, ref)) || fs.existsSync(path.join(root, path.dirname(f), ref))) { ok++; continue; }
+        const cands = (byBase.get(path.basename(ref)) || []);
+        if (cands.length) { moved++; lines.push(`MOVED   ${f}:${i + 1}  ${ref}  ->  ${cands.slice(0, 3).join(' | ')}${cands.length > 3 ? ` (+${cands.length - 3} more)` : ''}`); }
+        else { dead++; lines.push(`DELETED ${f}:${i + 1}  ${ref}`); }
+      }
+    });
+  }
+  log('## comment path references');
+  for (const l of lines) log(l);
+  log(`resolved ${ok}, moved ${moved}, deleted ${dead}. A moved pointer sends a reader to nothing: fix it in the commit that touches the file.`);
+  return moved + dead > 0;
+}
+function checkMap() {
+  log(`## map: ${path.relative(root, mapPath)}`);
+  if (!map.length) { log('- no map, or no hubs in it'); return false; }
+  let bad = false;
+  for (const h of map) { for (const r of mapEntries(h.hub)) { log(`- ${h.hub}: ${fmtMap(r)}`); if (r.dead) bad = true; } }
+  return bad;
+}
+
+// --- planning ids in added comments ----------------------------------------------------------------
+// Each form is one RegExp with the shape it matches in words; none is written out as a literal id.
+const IDS = [
+  ['phase id',        /\b[Pp]hase\s+\d{3}\b/],             // a Phase word and three digits; GSD tails follow it
+  ['quick id',        /\b[Qq]uick\s+\d{6}\b/],             // a Quick word and a date-shaped id
+  ['phase+decision',  /\b\d{3}\s+D\d{2}[a-z]?\b/],         // a three-digit phase number then a decision id
+  ['decision in ()',  /\([^()]*\bD\d{2}[a-z]?\b[^()]*\)/], // a decision id standing alone inside parentheses
+];
+const ID_LEAD = /^D\d{2}[a-z]?(?=[\s:,.)\/]|$)/;          // prose that opens with a decision id
+// Ids a standing rule or a durable record owns: a flag reason string, a ledger entry. Blanked, not skipped,
+// so a Phase word beside one still hits.
+const ALLOWED = [/\bFLAG-\d{3}-\d{2}\b/g, /\bledger\.md\s+L\d{3}\b/g, /\(L\d{3}\)/g];
+// Docs and rules cite decisions by design; config files are code and stay scanned.
+const EXEMPT = /(^|\/)(\.planning|node_modules|dist|build|vendor)\/|^docs\/|^\.claude\/rules\/|\.md$/;
+// The marker a comment trailing code opens with, by extension. An unlisted extension may use either of the
+// two common ones; a json file has no comments.
+const TRAILING = new Map();
+for (const [exts, ms] of [
+  ['py sh bash zsh yaml yml toml rb pl conf cfg ini env service timer', ['#']],
+  ['js jsx ts tsx mjs cjs svelte vue go rs c h cc cpp hpp java kt swift php css scss', ['//']],
+  ['sql lua hs', ['--']],
+  ['json', []],
+]) for (const e of exts.split(' ')) TRAILING.set(e, ms);
+const extOf = f => ((path.basename(f).match(/\.([A-Za-z0-9]+)$/) || [])[1] || '').toLowerCase();
+const markersFor = ext => TRAILING.has(ext) ? TRAILING.get(ext) : ['#', '//'];
+// Quotes are tracked only where `#` opens a comment and nothing else (a regex literal, a nested template)
+// can hold a quote: there a `#` inside a string is data. Elsewhere a marker inside a string is a hit, which is
+// loud; a quote paired wrongly would hide every comment after it, which is silent.
+const QUOTED = new Set('py sh bash zsh yaml yml toml conf cfg ini env service timer'.split(' '));
+// Index of the first trailing marker in a line outside a one-line string, or -1. A single quote right after a
+// word character is an apostrophe, unless the word is a Python string prefix.
+function trailingPos(line, markers, quotes = '') {
+  if (!markers.length) return -1;
+  const re = new RegExp(`(?:^|\\s)(?:${markers.map(escRe).join('|')})\\s`, 'y');
+  let open = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (open) {
+      if (c === '\\') i++;
+      else if (c === open) open = null;
+      continue;
+    }
+    if (quotes.includes(c)) {
+      const before = line.slice(0, i);
+      if (c !== '\'' || !/\w$/.test(before) || /(?:^|\W)[rRbBuUfF]{1,2}$/.test(before)) { open = c; continue; }
+    }
+    re.lastIndex = i;
+    const m = re.exec(line);
+    if (m) return m.index + m[0].search(/\S/);
+  }
+  return -1;
+}
+// A call that opens a statement and names a test with its first string argument. The start anchor keeps a
+// fixture that builds a test file's text (the call sits inside a string) from reading as a name.
+const TESTCALL = /^\s*(?:await\s+)?(?:(?:describe|it|test|context|suite)(?:\.\w+)*|t\.Run)\s*\(\s*(['"`])((?:\\.|(?!\1).)*)/;
+const PYDEF = /^\s*(?:async\s+)?def\s+(test\w*)/;
+
+// Python, walked left to right across the file: a `#` outside a string starts a comment, and strings nest on a
+// stack, an f-string's replacement field holding strings of its own (any quote since Python 3.12). Every
+// delimiter on a line is paired in order, so a line holding two of them leaves the walk on the right side. A
+// triple-quoted string, or a one-line string ending in a backslash, runs on to the next line. A triple-quoted
+// string that opens a line right after a line ending in a colon (or at the top of the module) is a docstring
+// and prose; any other is data.
+function proseOfPy(lines, isTestFile) {
+  let stack = [], prev = null;
+  return lines.map(line => {
+    if (!stack.length && !line.trim()) return null;
+    if (!stack.length && line.trim().startsWith('#')) return COMMENT.test(line) ? line : null;
+    const inData = stack.length > 0 && !stack[0].doc;
+    let doc = stack.length > 0 && stack[0].doc, comment = -1;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i], top = stack[stack.length - 1];
+      if (top && !top.depth) {
+        if (c === '\\') i++;
+        else if (line.startsWith(top.q, i)) { stack.pop(); i += top.q.length - 1; }
+        else if (top.f && (c === '{' || c === '}')) { if (line[i + 1] === c) i++; else if (c === '{') top.depth = 1; }
+        continue;
+      }
+      if (top && c === '{') { top.depth++; continue; }
+      if (top && c === '}') { top.depth--; continue; }
+      if (!top && c === '#') { comment = i; break; }
+      if (c !== '"' && c !== '\'') continue;
+      const q = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+      const prefix = (/(?:^|[^\w])([rRbBuUfF]{1,2})$/.exec(line.slice(0, i)) || [])[1] || '';
+      const isDoc = !top && q.length === 3 && /^(?:[rRuUbB]{1,2})?$/.test(line.slice(0, i).trim())
+        && (prev === null || prev.endsWith(':'));
+      stack.push({ q, f: /f/i.test(prefix), depth: 0, doc: isDoc });
+      if (isDoc) doc = true;
+      i += q.length - 1;
+    }
+    // A one-line string ends with its line unless a backslash continues it; a triple-quoted one runs on.
+    if (!line.endsWith('\\')) { const k = stack.findIndex(s => s.q.length === 1); if (k >= 0) stack = stack.slice(0, k); }
+    const code = (comment >= 0 ? line.slice(0, comment) : line).trim();
+    if (!stack.length && code) prev = code;
+    if (doc) return line;
+    const parts = [];
+    if (comment >= 0) parts.push(line.slice(comment));
+    if (isTestFile && !inData) { const d = PYDEF.exec(line); if (d) parts.push(d[1].replace(/_/g, ' ')); }
+    return parts.length ? parts.join('\n') : null;
+  });
+}
+function proseOfOther(ext, lines, isTestFile) {
+  const markers = markersFor(ext);
+  const regs = [{ open: '/*', close: '*/', lineStart: true }];
+  if (['html', 'htm', 'svelte', 'vue', 'xml'].includes(ext)) regs.push({ open: '<!--', close: '-->' });
+  if (['html', 'htm', 'jinja', 'j2'].includes(ext)) regs.push({ open: '{#', close: '#}' });
+  const quotes = QUOTED.has(ext) ? '\'"' : '';
+  let closeBy = null;
+  return lines.map(line => {
+    const parts = [];
+    if (closeBy) { parts.push(line); if (line.includes(closeBy)) closeBy = null; }
+    else {
+      let opened = false;
+      for (const r of regs) {
+        if (r.lineStart && !line.trim().startsWith(r.open)) continue;
+        const at = line.indexOf(r.open);
+        if (at < 0) continue;
+        parts.push(line.slice(at));
+        if (!line.includes(r.close, at + r.open.length)) closeBy = r.close;
+        opened = true; break;
+      }
+      if (!opened && COMMENT.test(line)) parts.push(line);
+      else if (!opened) { const p = trailingPos(line, markers, quotes); if (p >= 0) parts.push(line.slice(p)); }
+    }
+    if (isTestFile) { const t = TESTCALL.exec(line); if (t) parts.push(t[2]); }
+    return parts.length ? parts.join('\n') : null;
+  });
+}
+// Per line, the part of it that is prose (comment, docstring, test name) or null.
+function proseOf(file, lines) {
+  const ext = extOf(file), t = isTest(file);
+  return ext === 'py' ? proseOfPy(lines, t) : proseOfOther(ext, lines, t);
+}
+
+function git(args) {
+  const r = cp.spawnSync('git', ['-c', 'core.quotePath=false', ...args], { encoding: 'utf8', maxBuffer: 1 << 28 });
+  if (r.status !== 0) throw new Error((r.stderr || '').trim() || `git ${args[0]} failed`);
+  return r.stdout;
+}
+// Map<file, Set<line number in the new file>> and a reader of each file's new text.
+function addedLines(files, range) {
+  const added = new Map();
+  const mark = (f, a, b) => { if (!added.has(f)) added.set(f, new Set()); for (let n = a; n <= b; n++) added.get(f).add(n); };
+  const diffArgs = ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M', '--diff-filter=AMR'];
+  const out = git(range ? [...diffArgs, range, '--', ...files] : [...diffArgs.slice(0, 1), 'HEAD', ...diffArgs.slice(1), '--', ...files]).split('\n');
+  let file = null;
+  for (let i = 0; i < out.length;) {
+    const l = out[i];
+    const h = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(l);
+    if (h) {
+      let minus = h[2] === undefined ? 1 : +h[2], plus = h[4] === undefined ? 1 : +h[4];
+      if (file && plus > 0) mark(file, +h[3], +h[3] + plus - 1);
+      // The body is skipped by count: an added line that starts with two plus signs and a space is not a header.
+      for (i++; (minus > 0 || plus > 0) && i < out.length; i++) {
+        const b = out[i];
+        if (b.startsWith('\\')) continue;
+        if (b[0] === '-') minus--; else if (b[0] === '+') plus--; else break;
+      }
+      continue;
+    }
+    if (l.startsWith('+++ ')) {
+      const rest = l.slice(4).replace(/\t$/, '');
+      if (rest === '/dev/null') file = null;
+      else if (rest.startsWith('b/')) file = rest.slice(2);
+      else throw new Error('cannot read the diff header for ' + l);
+    }
+    i++;
+  }
+  if (!range) {
+    const un = git(['ls-files', '--others', '--exclude-standard', '-z', '--', ...files]).split('\0').filter(Boolean);
+    for (const f of un) {
+      const body = fs.readFileSync(f, 'utf8'), n = body.split('\n').length - (body.endsWith('\n') ? 1 : 0);
+      if (n > 0) mark(f, 1, n);
+    }
+  }
+  const b = range ? (range.split('..').pop() || 'HEAD') : null;
+  const newText = f => range ? git(['show', `${b}:${f}`]) : fs.readFileSync(f, 'utf8');
+  return { added, newText };
+}
+function checkIds(files, range) {
+  try {
+    const { added, newText } = addedLines(files, range);
+    let n = 0, k = 0;
+    const hitFiles = new Set(), lines = [];
+    for (const [file, set] of added) {
+      if (EXEMPT.test(file)) continue;
+      const text = newText(file).split('\n');
+      const prose = proseOf(file, text);
+      for (const ln of [...set].sort((x, y) => x - y)) {
+        k++;
+        const p = prose[ln - 1];
+        if (p === null || p === undefined) continue;
+        let blanked = p;
+        for (const a of ALLOWED) blanked = blanked.replace(a, m => ' '.repeat(m.length));
+        let form = null;
+        for (const part of blanked.split('\n')) {
+          if (ID_LEAD.test(part.replace(/^[\s#\/*;\-!<>{}]+/, ''))) { form = 'decision lead'; break; }
+          const hit = IDS.find(([, re]) => re.test(part));
+          if (hit) { form = hit[0]; break; }
+        }
+        if (!form) continue;
+        n++; hitFiles.add(file);
+        lines.push(`IDS ${file}:${ln}  ${form}  ${(text[ln - 1] || '').trim().slice(0, 160)}`);
+      }
+    }
+    for (const l of lines) log(l);
+    log(n > 0 ? `ids: ${n} added line(s) in ${hitFiles.size} file(s) carry a planning id. Drop the tag and state the reason in words, or cite ledger.md Lnnn.` : `ids: no planning id in ${k} added line(s)`);
+    return n > 0;
+  } catch (e) {
+    console.error('check-ids: ' + e.message);
+    process.exit(2);
+  }
+}
+
+let failed = false;
+if (opt.checkMap) failed = checkMap() || failed;
+if (opt.checkIds) failed = checkIds(opt.hubs, opt.range) || failed;
+if (opt.checkRefs) failed = checkRefs(opt.hubs) || failed;
+else if (!opt.checkIds) for (const h of opt.hubs) failed = radius(h) || failed;
+process.stdout.write(out.join('\n') + '\n');
+process.exit(failed ? 1 : 0);

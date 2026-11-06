@@ -1,0 +1,11 @@
+# .holden/radius.yaml — the readers grep cannot find. One entry per hub; each reader is a file, a
+# function and the condition under which it reads. `bin/h-radius --check-map` flags entries whose
+# file or function no longer exists. /h-learn adds an entry when a review or the operator names a
+# reader the research missed; the mechanical readers are never stored here, the tool rederives them.
+hubs:
+  - hub: invoices.status                     # a function, column, setting key, event or route, as grep would see it
+    readers:
+      - path: services/sync.py                # repo-root path
+        function: on_remote_update            # the function that reads it; "-" when the whole file does
+        when: only when the remote payload carries a status we map  # the branch grep does not show
+        phase: 012                             # where it was learned

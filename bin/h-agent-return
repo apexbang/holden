@@ -1,0 +1,38 @@
+#!/usr/bin/env node
+'use strict';
+// h-agent-return: print a finished subagent's final text, as it wrote it. A return pasted through
+// the main session is retyped and escaped on the way (> became &gt; in the first /h-audit map);
+// this copies it from the transcript instead.
+//   h-agent-return <output-file> [--demote N]
+// <output-file> is the path in the task notification; it links to the agent's transcript (.jsonl).
+// --demote N adds N levels to every markdown heading, so the return nests under the caller's own.
+// Exit 0 on a printed return; 1 when the transcript holds no final text; 2 = usage.
+const fs = require('fs');
+
+const args = process.argv.slice(2);
+const i = args.indexOf('--demote');
+const demote = i >= 0 ? Number(args.splice(i, 2)[1]) : 0;
+if (args.length !== 1 || !Number.isInteger(demote) || demote < 0) {
+  process.stderr.write('usage: h-agent-return <output-file> [--demote N]\n');
+  process.exit(2);
+}
+
+let text = null;
+for (const line of fs.readFileSync(args[0], 'utf8').split('\n')) {
+  if (!line.trim()) continue;
+  let o;
+  try { o = JSON.parse(line); } catch { continue; }
+  if (o.type !== 'assistant' || !Array.isArray(o.message?.content)) continue;
+  const t = o.message.content.filter(c => c.type === 'text').map(c => c.text).join('');
+  if (t.trim()) text = t;
+}
+if (text === null) { process.stderr.write(`h-agent-return: no final text in ${args[0]}\n`); process.exit(1); }
+
+if (demote) {
+  let fence = false;
+  text = text.split('\n').map(l => {
+    if (/^\s*(```|~~~)/.test(l)) fence = !fence;
+    return !fence && /^#{1,6} /.test(l) ? '#'.repeat(demote) + l : l;
+  }).join('\n');
+}
+process.stdout.write(text.endsWith('\n') ? text : text + '\n');

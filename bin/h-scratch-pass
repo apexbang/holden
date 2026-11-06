@@ -1,0 +1,435 @@
+#!/usr/bin/env node
+'use strict';
+// h-scratch-pass: delete the scratch records of landed or archived phases and of complete or
+// landed quicks once nothing reads them, and keep the records that are re-read (ledger.md L007).
+// It acts on each selected state entry at the entry's own dir:, wherever that directory sits.
+//   h-scratch-pass --dry-run <path>...   print what a run would delete, keep and hold back; write nothing
+//   h-scratch-pass <path>...             the same, then one metadata commit of the deletions and the state
+//                                        edits; run it under the landing lock: h-queue lock -- h-scratch-pass <path>...
+// Each commit's message names its parent: git checkout <parent> -- <path> recovers a deleted file.
+// <path> is a directory inside the repo; the pass acts on each entry whose dir: is it or lies under it.
+// HOLDEN_OBSERVATIONS names the observations file (default: observations.md of this holden checkout).
+// Exit 0 printed, 1 refused, 2 usage.
+const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process');
+const yaml = require('../lib/yaml-lite.js');
+const R = require('../lib/registry.js');
+
+const HELP = (() => { const ls = fs.readFileSync(__filename, 'utf8').split('\n').slice(2); return ls.slice(0, ls.findIndex(l => !l.startsWith('//'))).join('\n'); })();
+
+// Kept at the top of a directory: these four bare or behind the directory's own prefix, these three bare.
+const PREFIXED = ['DECISION.md', 'FACTS.md', 'HUMAN-UAT.md', 'CONTEXT.md'];
+const BARE = ['ledger.md', 'state.yaml', 'asks.yaml'];
+const DONE = { phase: ['landed', 'archived'], quick: ['complete', 'landed'] };
+// file and dir are repo paths; `<p>-DECISION.md` is a record only when `<p>-` starts the directory's name.
+function keptName(dir, file) {
+  if (path.posix.dirname(file) !== dir) return false;
+  const name = path.posix.basename(file), base = path.posix.basename(dir);
+  if (BARE.includes(name) || PREFIXED.includes(name)) return true;
+  return PREFIXED.some(k => {
+    if (!name.endsWith('-' + k)) return false;
+    const p = name.slice(0, -k.length - 1);
+    return base === p || base.startsWith(p + '-');
+  });
+}
+
+const git = (root, args, o = {}) => cp.spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 28, ...o });
+
+// An observations line as bin/h-prune:34 reads it: - <date> <repo> <NNN> [<agent>]: ...
+const LINE = /^- (\d{4}-\d{2}-\d{2}) (\S+) (\S+?)(?: ([a-z-]+))?: /;
+// A phase number as a key, as bin/h-queue:458 phaseKey: 1, 01 and 001 are one key.
+const phaseKey = n => { const s = String(n).trim(); return /^\d+$/.test(s) ? String(parseInt(s, 10)) : s; };
+function readObservations(file, repo) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return { error: `cannot read ${file}: ${e.code || e.message}; nothing done` }; }
+  const lines = [];
+  text.split('\n').forEach((l, i) => {
+    const m = l.startsWith('- ') && l.match(LINE); if (!m) return;
+    const clean = !m[4] && /: clean\b/.test(l);                       // bin/h-prune:37
+    lines.push({ n: i + 1, text: l, date: m[1], repo: m[2], slot: m[3],
+      open: !clean && !/\bstruck \(/.test(l) && !/declined: /.test(l) });  // bin/h-prune:39, :43
+  });
+  const mine = lines.filter(o => o.repo === repo);
+  return { file, text, lines, first: mine.map(o => o.date).sort()[0] || null, learned: new Set(mine.map(o => phaseKey(o.slot))) };
+}
+
+const isMap = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const set = v => v !== null && v !== undefined && String(v).trim() !== '';
+// The highest-round diff review report among the directory's top files (skills/h-execute/SKILL.md step 6 names them).
+function diffReport(root, x) {
+  const found = [];
+  for (const f of x.files) {
+    if (path.posix.dirname(f) !== x.dir) continue;
+    const b = path.posix.basename(f);
+    let m;
+    if ((m = b.match(/^DIFF-CODEX-REVIEW-r(\d+)\.md$/))) found.push({ f, round: +m[1], codex: true });
+    else if ((m = b.match(/-REVIEW-self[^/]*-r(\d+)\.md$/))) {
+      const first = (blobOf(root, f) || '').split('\n')[0];
+      if (/^# Self review \(diff\), round \d+/.test(first)) found.push({ f, round: +m[1], codex: false });
+    }
+  }
+  if (!found.length) return null;
+  found.sort((a, b) => b.round - a.round || (b.codex - a.codex));
+  const rep = found[0], lines = (blobOf(root, rep.f) || '').split('\n');
+  const i = lines.findIndex(l => /^## Verdict\s*$/.test(l));
+  let verdict = 'unknown';
+  if (i >= 0) { const next = lines.slice(i + 1).find(l => l.trim() !== ''); const m = next && next.match(/^\**([A-Z][A-Z-]*)\b/); if (m) verdict = m[1]; }
+  let date = git(root, ['log', '-1', '--format=%cs', 'HEAD', '--', rep.f]).stdout.trim();
+  if (!date) date = /^\d{4}-\d{2}-\d{2}$/.test(String(x.e.landed)) ? String(x.e.landed) : 'unknown';
+  return { date, verdict };
+}
+function blobOf(root, f) { const r = git(root, ['cat-file', 'blob', 'HEAD:' + f]); return r.status === 0 ? r.stdout : null; }
+
+// bin/h-queue:513 realAbs: the longest existing prefix realpath'd, the rest kept.
+const realAbs = p => { let d = p, tail = ''; while (d !== '/' && !fs.existsSync(d)) { tail = path.posix.join(path.posix.basename(d), tail); d = path.posix.dirname(d); } try { return path.posix.join(fs.realpathSync(d), tail); } catch { return p; } };
+// A clone of a local checkout (git clone ~/projects/x) reads an absolute path into that checkout as its own path,
+// so a run on the clone keeps what the same run on the checkout would.
+function originRoot(root) {
+  const u = (git(root, ['remote', 'get-url', 'origin']).stdout || '').trim().replace(/^file:\/\//, '');
+  if (!u.startsWith('/')) return null;
+  try { return fs.realpathSync(u.replace(/\/\.git\/?$/, '')); } catch { return null; }
+}
+
+// Keep every candidate (a file no record name keeps) that a shared file, another directory's kept record or an
+// open observation line names; ledger.md L007 and the plan's pointer forms: a repo or absolute path, a ../ path,
+// a bare file name with the directory's prefix, a prefixed stem, an unprefixed name only beside a directory it names.
+// Returns { error } or { unscoped } (report lines for names that scope to no directory).
+function applyPointers(root, acts, entries, obs) {
+  const cand = new Map();                 // repo path -> its entry
+  for (const x of acts) for (const f of x.del) cand.set(f, x);
+  const byName = new Map(), byStem = new Map(), byBase = new Map();
+  const push = (m, k, v) => { if (!m.has(k)) m.set(k, []); m.get(k).push(v); };
+  for (const f of cand.keys()) { const b = path.posix.basename(f); push(byName, b, f); const s = b.replace(/\.[^.]*$/, ''); if (s !== b) push(byStem, s, f); }
+  for (const x of acts) push(byBase, path.posix.basename(x.dir), x);
+  const unscoped = new Set();             // report lines for a name no directory scopes
+  const lead = d => path.posix.basename(d).split('-')[0];    // a phase number or quick id: 001, 261018, 10
+  const actOf = r => acts.find(x => r === x.dir || r.startsWith(x.dir + '/')) || null;
+  const keep = (f, why) => { const x = cand.get(f); if (x && !x.keep.has(f)) x.keep.set(f, why); };
+  const bases = [root, originRoot(root)].filter(Boolean);
+
+  function resolveTok(t, from) {
+    const p = t.startsWith('~/') ? path.join(os.homedir(), t.slice(2)) : t;
+    if (p.startsWith('/')) {
+      const a = realAbs(p);
+      for (const b of bases) { const r = path.posix.relative(b, a); if (r && !r.startsWith('..')) return r.replace(/\/+$/, ''); }
+      return null;
+    }
+    if (!from.repoPaths) return null;
+    if (p.startsWith('./') || p.startsWith('../')) {
+      if (from.dir === null) return null;
+      const r = path.posix.normalize(path.posix.join(from.dir, p)); return r.startsWith('..') ? null : r.replace(/\/+$/, '');
+    }
+    return path.posix.normalize(p).replace(/\/+$/, '');
+  }
+
+  function scanLine(line, where, from) {
+    const toks = line.split(/[^A-Za-z0-9_.\/~-]+/).map(t => t.replace(/\.+$/, '')).filter(Boolean);
+    const named = new Set(from.named || []), ptrs = [], bares = [];
+    for (const t of toks) {
+      if (t.includes('/')) { const r = resolveTok(t, from); const x = r === null ? null : actOf(r); if (x && x !== from.own) { named.add(x); ptrs.push([r, x]); } }
+      else { for (const x of byBase.get(t) || []) if (x !== from.own) named.add(x); bares.push(t); }
+    }
+    for (const [r, x] of ptrs) {
+      if (r === x.dir) { if (!x.dirNamed) x.dirNamed = where; continue; }    // the directory itself keeps no file
+      for (const f of x.del) if (f === r || f.startsWith(r + '/')) keep(f, from.why(where));
+    }
+    if (!from.bare) return;
+    for (const t of bares) {
+      const own = f => cand.get(f) === from.own;
+      const pre = f => t.startsWith(lead(cand.get(f).dir) + '-');
+      const exact = (byName.get(t) || []).filter(f => !own(f)), stem = (byStem.get(t) || []).filter(f => !own(f) && pre(f));
+      for (const f of [...exact.filter(pre), ...stem]) keep(f, from.why(where));
+      const un = exact.filter(f => !pre(f));
+      if (!un.length) continue;
+      if (named.size) { for (const f of un) if (named.has(cand.get(f))) keep(f, from.why(where)); }
+      else unscoped.add(`unscoped ${t} at ${where}: names no directory; kept nothing`);
+    }
+  }
+
+  const scanText = (text, file, from, skip) => {
+    text.split('\n').forEach((l, i) => { if (!(skip && skip(l))) scanLine(l, `${file}:${i + 1}`, from); });
+  };
+  const named = w => 'named by ' + w;
+  // The shared files, at HEAD; one a repo does not have is skipped. state.yaml's own dir: lines are not pointers.
+  for (const f of require(path.join(__dirname, 'h-queue')).SHARED) {
+    const text = blobOf(root, f); if (text === null) continue;
+    scanText(text, f, { dir: path.posix.dirname(f), own: null, repoPaths: true, bare: true, named: [], why: named },
+      f === '.planning/state.yaml' ? l => /^\s*dir:\s/.test(l) : null);
+  }
+  // Every kept-name file of every entry with a dir, read at HEAD so an uncommitted edit cannot free its target.
+  for (const e of entries) {
+    if (e.dir === null) continue;
+    const files = e.files || (git(root, ['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', e.dir]).stdout || '').split('\0').filter(Boolean);
+    for (const f of files.filter(f => keptName(e.dir, f))) {
+      const text = blobOf(root, f);
+      if (text === null) return { error: `cannot read ${f} at HEAD; nothing done` };
+      scanText(text, f, { dir: path.posix.dirname(f), own: acts.find(x => x.dir === e.dir) || null, repoPaths: true, bare: true, named: [], why: named });
+    }
+  }
+  // Every open observations line, from any repo; another repo's line counts only by absolute path.
+  const repo = path.basename(root);
+  for (const o of obs.lines) {
+    if (!o.open) continue;
+    const mine = o.repo === repo;
+    scanLine(o.text, `${obs.file}:${o.n}`, { dir: null, own: null, repoPaths: mine, bare: mine,
+      named: mine ? acts.filter(x => x.kind === 'phase' && phaseKey(x.e.number) === phaseKey(o.slot)) : [], why: w => 'cited by ' + w });
+  }
+  for (const x of acts) x.del = x.del.filter(f => !x.keep.has(f));
+  return { unscoped: [...unscoped].sort() };
+}
+function diffGate(root, x) {
+  const r = x.e.review;
+  if (r !== undefined && r !== null && !isMap(r) && !(x.kind === 'quick' && 'goal' in x.e && typeof r === 'string'))
+    return { reason: 'review is not a map; review.diff_done cannot be written' };
+  if (isMap(r) && set(r.diff_done)) return { ok: true, write: null };
+  if (x.kind === 'quick') {
+    // skills/h-quick/SKILL.md step 1 writes goal: into every quick since the red-test quick;
+    // step 9 writes review: "<reader> <verdict>" only after its diff review ran.
+    if (!('goal' in x.e)) return { ok: true, write: 'waived' };
+    return typeof r === 'string' && r.trim() ? { ok: true, write: null } : { reason: 'diff review neither done nor waived' };
+  }
+  // A phase from before the diff review carries no review: key; a holden-era phase always has the map.
+  if (r === undefined || r === null) return { ok: true, write: 'waived' };
+  if (r['diff'] === 'none') return { ok: true, write: 'waived' };
+  const rep = diffReport(root, x);
+  return rep ? { ok: true, write: `${rep.date} ${rep.verdict}` } : { reason: 'diff review neither done nor waived' };
+}
+
+const normDir = d => d === undefined || d === null || String(d) === '' ? null : path.posix.normalize(String(d)).replace(/^\.\//, '').replace(/\/+$/, '');
+// Holden has no YAML writer (ledger.md L003): the pass edits state.yaml as lines. An entry is a list
+// item at indent 2 under the top-level phases: or quick: key, up to the next item or top-level key.
+function entryBlocks(lines) {
+  const out = []; let section = null, cur = null;
+  const close = i => { if (cur) { cur.end = i; out.push(cur); cur = null; } };
+  lines.forEach((l, i) => {
+    if (/^[A-Za-z_][\w-]*:/.test(l)) { close(i); section = l.split(':')[0]; return; }
+    if (/^  - /.test(l)) { close(i); if (section === 'phases' || section === 'quick') cur = { start: i, end: null }; }
+  });
+  close(lines.length);
+  return out;
+}
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Each entry block holding a `dir:` line that names dir, quoted or not, with or without a trailing slash or comment.
+function locateEntry(lines, dir) {
+  const re = new RegExp(`^    dir:\\s*(["']?)${esc(dir)}/?\\1\\s*(#.*)?$`), hits = [];
+  for (const b of entryBlocks(lines)) for (let i = b.start; i < b.end; i++) if (re.test(lines[i])) hits.push({ ...b, dirLine: i });
+  return hits;
+}
+// The review: map of one entry block gains diff_done after its last nested line; an entry with no
+// review: gets one before its dir: line; `review: {}` becomes a map.
+function writeDiffDone(lines, b, value) {
+  const out = lines.slice(), line = `      diff_done: ${value}`;
+  let r = -1; for (let i = b.start; i < b.end; i++) if (/^    review:/.test(out[i])) { r = i; break; }
+  if (r < 0) { out.splice(b.dirLine, 0, '    review:', line); return out; }
+  if (/^    review:\s*\{\}\s*(#.*)?$/.test(out[r])) { out.splice(r, 1, '    review:', line); return out; }
+  if (!/^    review:\s*(#.*)?$/.test(out[r])) throw new Error(`review of the entry at line ${r + 1} is not a map`);
+  let j = r + 1; while (j < b.end && /^      /.test(out[j])) j++;
+  for (let k = r + 1; k < j; k++) if (/^      diff_done:/.test(out[k])) { out[k] = line; return out; }
+  out.splice(j, 0, line); return out;
+}
+const one = (hits, dir) => { if (hits.length !== 1) throw new Error(`state entry of ${dir} not found once`); return hits[0]; };
+// Each entry's write first, then its drop, which locates the dir: line again.
+function applyEdits(lines, xs) {
+  for (const x of xs) {
+    if (x.write) lines = writeDiffDone(lines, one(locateEntry(lines, x.dir), x.dir), x.write);
+    if (x.dropDir) { const h = one(locateEntry(lines, x.dir), x.dir); lines = lines.slice(); lines.splice(h.dirLine, 1); }
+  }
+  return lines;
+}
+// The edited text must parse and show each edit on the entry at its old list position, nothing else moved.
+function readBack(text, xs, head) {
+  let st;
+  try { st = yaml.parse(text); } catch (e) { throw new Error(`the edited .planning/state.yaml does not read back: ${e.message}`); }
+  st = st || {};
+  const lists = { phase: Array.isArray(st.phases) ? st.phases : [], quick: Array.isArray(st.quick) ? st.quick : [] };
+  if (lists.phase.length !== head.phase || lists.quick.length !== head.quick) throw new Error('the edited .planning/state.yaml does not read back: a list changed length');
+  for (const x of xs) {
+    const y = lists[x.kind][x.index], miss = () => new Error(`the edited .planning/state.yaml does not read back for ${x.dir}`);
+    if (!y || String(x.kind === 'phase' ? y.number : y.id) !== String(x.kind === 'phase' ? x.e.number : x.e.id)) throw miss();
+    if (x.write && !(isMap(y.review) && String(y.review.diff_done) === x.write)) throw miss();
+    if (x.dropDir ? set(y.dir) : normDir(y.dir) !== x.dir) throw miss();
+  }
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  if (argv.includes('-h') || argv.includes('--help')) { console.log(HELP); return 0; }
+  const bad = argv.find(a => a.startsWith('-') && a !== '--dry-run');
+  if (bad) { console.error('unknown flag ' + bad); return 2; }
+  const args = argv.filter(a => !a.startsWith('-'));
+  const dry = argv.includes('--dry-run');
+  if (!args.length) { console.error('usage: h-scratch-pass [--dry-run] <path>...'); return 2; }
+  let root;
+  try { root = fs.realpathSync(R.mainRoot(process.cwd())); } catch (e) { console.error('not a git repository'); return 2; }
+  const paths = [];
+  for (const a of args) {
+    const r0 = path.relative(root, path.resolve(fs.realpathSync(process.cwd()), a)).replace(/\\/g, '/');
+    const r = path.posix.normalize(r0).replace(/\/+$/, '');
+    if (!r || r === '.' || path.posix.isAbsolute(r) || r.startsWith('..')) { console.error('not a path inside the repo: ' + a); return 2; }
+    paths.push(r);
+  }
+  // bin/h-queue underLanding sets this for the command it wraps (bin/h-snapshot commitPatch reads it the same way):
+  // nothing lands and no metadata commit moves HEAD between this run's read and its commit.
+  if (!dry && process.env.HOLDEN_LANDING_HELD !== '1') {
+    console.error(`h-scratch-pass commits under the landing lock: h-queue lock -- h-scratch-pass ${paths.join(' ')}`);
+    return 2;
+  }
+  const blob = git(root, ['cat-file', 'blob', 'HEAD:.planning/state.yaml']);
+  if (blob.status !== 0) { console.error('no .planning/state.yaml at HEAD'); return 1; }
+  let st;
+  try { st = yaml.parse(blob.stdout); } catch (e) { console.error('.planning/state.yaml at HEAD does not parse: ' + e.message); return 1; }
+  st = st || {};
+  const entries = [];
+  (Array.isArray(st.phases) ? st.phases : []).forEach((e, index) => { if (e) entries.push({ kind: 'phase', label: 'phase ' + e.number, e, index }); });
+  (Array.isArray(st.quick) ? st.quick : []).forEach((e, index) => { if (e) entries.push({ kind: 'quick', label: 'quick ' + e.id, e, index }); });
+  for (const x of entries) {
+    const d = x.e.dir;
+    x.dir = normDir(d);
+  }
+  const selected = entries.filter(x => DONE[x.kind].includes(x.e.status));
+  const inScope = x => x.dir !== null && paths.some(s => x.dir === s || x.dir.startsWith(s + '/'));
+  const sel = selected.filter(inScope);
+  if (!sel.length) { console.error(`no landed or archived phase and no complete or landed quick has its dir under ${paths.join(', ')}`); return 1; }
+  const repoName = path.basename(root);
+  const obs = readObservations(process.env.HOLDEN_OBSERVATIONS || path.join(__dirname, '..', 'observations.md'), repoName);
+  if (obs.error) { console.error(obs.error); return 1; }
+  for (const x of selected) if (x.dir === null) console.log(`skip ${x.label}: no dir`);
+  if (dry) console.log('dry run: nothing written');
+  if (!obs.first) console.log(`observations: no line for repo ${repoName}`);
+
+  let skipped = selected.filter(x => x.dir === null).length;
+  for (const x of sel) {
+    const r = git(root, ['ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', x.dir]);
+    x.files = (r.stdout || '').split('\0').filter(Boolean).sort();
+    if (!x.files.length) { console.log(`skip ${x.label}: no files at HEAD under ${x.dir}`); x.skip = true; skipped++; continue; }
+    x.keep = new Map(x.files.filter(f => keptName(x.dir, f)).map(f => [f, 'kept name']));
+    x.del = x.files.filter(f => !x.keep.has(f));
+  }
+
+  const acts = sel.filter(x => !x.skip);
+  const ptr = applyPointers(root, acts, entries, obs);
+  if (ptr.error) { console.error(ptr.error); return 1; }
+
+  // One status over every directory; a rename or copy record is followed by its old path.
+  const dirty = new Set();
+  if (acts.length) {
+    const rec = git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...acts.map(x => x.dir)]).stdout.split('\0');
+    for (let i = 0; i < rec.length; i++) {
+      if (rec[i].length < 4) continue;
+      dirty.add(rec[i].slice(3));
+      if (/[RC]/.test(rec[i].slice(0, 2)) && rec[i + 1]) dirty.add(rec[++i]);
+    }
+  }
+
+  // The gates, in D03's order: the first failure holds the directory whole.
+  for (const x of acts) {
+    if (x.kind === 'phase' && !(obs.learned.has(phaseKey(x.e.number)) ||
+        (obs.first && /^\d{4}-\d{2}-\d{2}$/.test(String(x.e.landed)) && String(x.e.landed) < obs.first))) {
+      x.held = `/h-learn has not run for phase ${x.e.number}`; continue;
+    }
+    const L = x.del.filter(f => /LEDGER[^/]*\.md$/.test(path.posix.basename(f)));
+    if (L.length) {
+      const s = require(path.join(__dirname, 'h-queue')).stampScan(root, L.map(f => path.join(root, f)));
+      if (s.missed + s.pending > 0) { x.held = `${s.missed + s.pending} pending or missed stamp(s) in a ledger it would delete`; x.heldLines = s.lines; continue; }
+    }
+    const g = diffGate(root, x);
+    if (!g.ok) { x.held = g.reason; continue; }
+    x.write = g.write;
+    const mine = [...dirty].filter(f => f === x.dir || f.startsWith(x.dir + '/')).sort();
+    const emptied = x.del.length === x.files.length;
+    const hit = emptied ? mine[0] : mine.find(f => x.del.includes(f));
+    if (hit) { x.held = `uncommitted change in ${hit}`; continue; }
+    if (x.dirNamed && x.del.length === x.files.length) x.held = `${x.dirNamed} names the directory, which would be emptied`;
+  }
+
+  // After the gates: what each entry's state edit is, and what keeps the commit whole (a hold never aborts the rest).
+  const headLines = blob.stdout.split('\n'), headLen = { phase: (Array.isArray(st.phases) ? st.phases : []).length, quick: (Array.isArray(st.quick) ? st.quick : []).length };
+  for (const x of acts) {
+    if (x.held || !x.del.length) continue;
+    if (x.del.length === x.files.length) {
+      if (x.kind === 'phase' && x.e.status === 'landed') { x.held = 'every file would go and the phase is landed; h-milestone close reads its directory'; continue; }
+      x.dropDir = true;
+    }
+  }
+  // bin/h-queue:1028's key; meta commit refuses a key that repeats (bin/h-queue:1037).
+  const quickEntries = entries.filter(y => y.kind === 'quick');
+  const keyOf = y => y.dropDir ? String(y.e.id) : (y.e.dir ? path.posix.basename(String(y.e.dir)) : String(y.e.id));
+  for (;;) {
+    const keys = new Map();
+    for (const y of quickEntries) { const k = keyOf(y); keys.set(k, [...(keys.get(k) || []), y]); }
+    const badKeys = [...keys].filter(([, ys]) => ys.length > 1 && ys.some(y => y.dropDir));
+    if (!badKeys.length) break;
+    for (const [k, ys] of badKeys) for (const y of ys) if (y.dropDir) { y.dropDir = false; y.keptDir = `quick key ${k} would appear ${ys.length} times`; }
+  }
+  for (const x of acts) {
+    if (x.held || !x.del.length || !(x.write || x.dropDir)) continue;
+    const hits = locateEntry(headLines, x.dir);
+    if (hits.length !== 1) { x.held = `state entry not found once by its dir: line (${hits.length} found)`; continue; }
+    try { readBack(applyEdits(headLines, [x]).join('\n'), [x], headLen); } catch (e) { x.held = `the state edit would not read back: ${e.message}`; }
+  }
+
+  let nDel = 0, nAct = 0, nHeld = 0;
+  for (const x of acts) {
+    if (x.held) {
+      nHeld++;
+      console.log(`held ${x.dir}: ${x.held}`);
+      for (const l of x.heldLines || []) console.log(`  ${l}`);
+      continue;
+    }
+    nAct++; nDel += x.del.length;
+    console.log(`act ${x.dir}: delete ${x.del.length}, keep ${x.keep.size}`);
+    for (const f of [...x.del].sort()) console.log(`  delete ${f}`);
+    for (const f of [...x.keep.keys()].sort()) console.log(`  keep ${f}: ${x.keep.get(f)}`);
+    if (x.write) console.log(`  state ${x.dir}: review.diff_done: ${x.write}`);
+    if (x.dropDir) console.log(`  state ${x.dir}: dir: dropped`);
+    if (x.keptDir) console.log(`  state ${x.dir}: dir: kept, ${x.keptDir}`);
+  }
+  for (const l of ptr.unscoped) console.log(l);
+  console.log(`total: act ${nAct}, delete ${nDel}, held ${nHeld}, skipped ${skipped}`);
+  const done = acts.filter(x => !x.held && x.del.length > 0);
+  if (!done.length) { console.log('nothing to delete'); return 0; }
+  if (dry) return 0;
+  return commit(root, paths, sel, done, obs, headLen);
+}
+
+// One metadata transaction under the landing lock: open, edit the work copy, list the removals, commit.
+function commit(root, paths, sel, acts, obs, headLen) {
+  const hq = (...a) => cp.spawnSync(process.execPath, [path.join(__dirname, 'h-queue'), ...a], { cwd: root, env: process.env, encoding: 'utf8', maxBuffer: 1 << 28 });
+  const M = require(path.join(__dirname, '..', 'lib', 'meta.js'));
+  const op = hq('meta', 'open', '.planning/state.yaml');
+  const token = (op.stdout.match(/^token (\S+)$/m) || [])[1];
+  if (op.status !== 0 || !token) { console.error(`h-queue meta open failed: ${op.stdout}${op.stderr}`); return 1; }
+  const abort = () => hq('meta', 'abort', token);
+  try {
+    const T = M.tokenDir(root, token), work = path.join(T, 'work', '.planning', 'state.yaml');
+    const text = applyEdits(fs.readFileSync(work, 'utf8').split('\n'), acts).join('\n');
+    readBack(text, acts, headLen);
+    fs.writeFileSync(work, text);
+    fs.writeFileSync(path.join(T, 'remove'), acts.flatMap(x => x.dropDir ? [x.dir] : x.del).join('\n') + '\n');
+  } catch (e) { abort(); console.error(`${e.message}; nothing committed`); return 1; }
+  const parent = git(root, ['rev-parse', 'HEAD']).stdout.trim();
+  const n = acts.reduce((a, x) => a + x.del.length, 0), held = sel.filter(x => x.held);
+  const msg = [
+    `docs(scratch): delete scratch records under ${paths.join(', ')}`,
+    '',
+    `Deleted ${n} file(s) from ${acts.length} director(ies); held back ${held.length}.`,
+    `Parent: ${parent}`,
+    `Recover a deleted file: git checkout ${parent} -- <path>, the same as git checkout <this commit>^ -- <path>; holden never rewrites history, so the parent stays reachable.`,
+    '',
+    'Directories:',
+    ...acts.map(x => `  ${x.dir}: deleted ${x.del.length}, kept ${x.keep.size}` + (x.write ? `, review.diff_done: ${x.write}` : '') + (x.dropDir ? ', dir: dropped' : '')),
+    ...(held.length ? ['', 'Held back:', ...held.map(x => `  ${x.dir}: ${x.held}`)] : []),
+  ].join('\n');
+  // /h-learn appends to the file under holden's landing lock, which does not order it against this repo's lock;
+  // a line appended since the start may cite a file in remove.
+  let again = null;
+  try { again = fs.readFileSync(obs.file, 'utf8'); } catch (e) { /* treated as changed */ }
+  if (again !== obs.text) { abort(); console.error('observations.md changed during the run; run again'); return 1; }
+  const c = hq('meta', 'commit', token, '-m', msg);
+  process.stdout.write(c.stdout + c.stderr);
+  if (c.status !== 0) { abort(); console.error(`h-queue meta commit exited ${c.status}; nothing committed`); return 1; }
+  const back = git(root, ['rev-parse', 'HEAD^']).stdout.trim();
+  if (back !== parent) { console.error(`HEAD^ is ${back}, not the parent ${parent} the message names`); return 1; }
+  return 0;
+}
+
+process.exit(main());

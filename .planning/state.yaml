@@ -1,0 +1,8 @@
+# holden state. Mechanical facts only; reasons live in ledger.md and each phase's DECISION.md.
+holden: 1
+project: holden
+milestone: null
+paused_milestones: []      # entries: {name, goal, opened, paused}; /h-milestone pause|resume
+current_phase: 0
+phases: []
+quick: []                  # entries: {id, slug, status, date, dir}

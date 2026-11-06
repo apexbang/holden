@@ -1,0 +1,27 @@
+# holden state. Mechanical facts only; reasons live in ledger.md and each phase's DECISION.md.
+holden: 1
+project: example
+milestone:
+  name: v1.0
+  goal: One line.
+  opened: 2026-01-01
+paused_milestones: []      # entries: {name, goal, opened, paused}; /h-milestone pause|resume
+current_phase: 1
+phases:
+  - number: 1
+    slug: example-phase
+    milestone: v1.0
+    status: grilled        # grilled | planned | executing | landed | archived
+    goal: One line, what this phase makes true.
+    review:
+      plan: self           # none | self | codex; the plan review
+      diff: self           # none | self | codex; the diff review after the last plan lands
+      diff_done: null      # "<YYYY-MM-DD> <verdict>" or waived, written by /h-execute step 7; bin/h-scratch-pass writes it for an older entry
+    models: {}             # per-phase overrides of config models: researcher | planner | executor | reviewer
+    created: 2026-01-01
+    landed: null           # date the last plan's commit landed
+    full_suite: null       # pass | fail | null, written by /h-execute after the last plan
+    tested: null           # the SHA the passing full suite's stamp names (HEAD at the end of the run, same code tree as the one tested), written with full_suite: pass
+    deploy: null           # deploy id or date, written by the operator or deploy script
+    dir: .planning/phases/001-example-phase
+quick: []                  # entries: {id, slug, status, date, dir, goal}; complete adds commits (quoted shas), cold_read, review, findings (skills/h-quick); bin/h-scratch-pass drops dir when it removes an emptied directory, and writes review.diff_done: waived for an entry with no goal

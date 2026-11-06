@@ -1,0 +1,330 @@
+#!/usr/bin/env node
+'use strict';
+// h-test: prove a change is covered by a test that depends on it, without git stash.
+//   h-test [<commit>] [--uncommitted] [--tests f1 f2 ...] [--refactor] [--ledger FILE]
+//   h-test --full [--ledger FILE]
+//   h-test --run --tests f1 f2 ... [--ledger FILE]
+//   h-test --scratch <ref> [--patch FILE] [--ledger FILE] -- <command>
+//   h-test --deps [f1 f2 ...] [--ledger FILE]
+// Proof of commit C (parent P): a temporary worktree at P with only C's test-file hunks applied
+// must run RED; C must run GREEN. --refactor: GREEN at both. --uncommitted (or a dirty tree with
+// no commit given) is proved via a dangling temporary commit built from a scratch index; the
+// working tree, index and stash are never touched. After GREEN, every test file that names a changed
+// file as a quoted path ('App.svelte', /spec.md") also runs at C; red there and green at P fails the proof.
+// --full runs the repo's full suite and writes
+// .holden/test-stamp on pass (sha, code_tree hash ignoring docs/planning paths, dirty hash); the stamp
+// is refused when HEAD's code tree or the dirty hash changed during the run. --code-tree [ref]
+// prints the code-tree hash for deploy scripts. --deps runs tests.deps for each changed dependency
+// manifest (default: the uncommitted changes), from the manifest's own directory.
+// Every mode but --code-tree runs under the machine-wide test mutex (lib/machine.js); HOLDEN_MUTEX_HELD=1 marks a run that already holds it.
+// Exit 0 = proved, 1 = refused or failed, 2 = usage, 75 = the machine's test mutex stayed busy for 9 minutes: run it again.
+const fs = require('fs'), path = require('path'), cp = require('child_process'), os = require('os'), crypto = require('crypto');
+const yaml = require(path.join(__dirname, '..', 'lib', 'yaml-lite.js'));
+
+const argv = process.argv.slice(2), dd = argv.indexOf('--');
+// One word after -- is a shell string; several are argv, quoted so `bash -c '...'` keeps its quotes.
+const shq = w => /^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`;
+const afterDd = dd < 0 ? [] : argv.slice(dd + 1);
+const args = dd < 0 ? argv : argv.slice(0, dd), scratchCmd = afterDd.length === 1 ? afterDd[0] : afterDd.map(shq).join(' ');
+const opt = { commit: null, uncommitted: false, tests: [], refactor: false, ledger: null, full: false, run: false, scratch: null, patch: null, deps: null };
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '--uncommitted') opt.uncommitted = true;
+  else if (a === '--refactor') opt.refactor = true;
+  else if (a === '--full') opt.full = true;
+  else if (a === '--run') opt.run = true;
+  else if (a === '--scratch') opt.scratch = args[++i];
+  else if (a === '--patch') opt.patch = path.resolve(args[++i]);   // before the chdir to the repo root
+  else if (a === '--code-tree') {}
+  else if (a === '--ledger') opt.ledger = args[++i];
+  else if (a === '--tests') { while (args[i + 1] && !args[i + 1].startsWith('--')) opt.tests.push(args[++i]); }
+  else if (a === '--deps') { opt.deps = []; while (args[i + 1] && !args[i + 1].startsWith('--')) opt.deps.push(args[++i]); }
+  else if (a === '-h' || a === '--help') { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 20).join('\n')); process.exit(0); }
+  else if (a.startsWith('--')) { console.error('unknown flag ' + a); process.exit(2); }
+  else opt.commit = a;
+}
+// D06: every mode that runs tests waits for the machine-wide mutex first, by re-running this same
+// command under it; the re-run inherits HOLDEN_MUTEX_HELD=1, so it and any h-test nested in its
+// commands (a Verify under --scratch) skip this line. A 75 here has run nothing and recorded nothing.
+const machine = require(path.join(__dirname, '..', 'lib', 'machine.js'));
+const runsTests = !args.includes('--code-tree');
+if (runsTests && !machine.held()) process.exit(machine.acquireAndRun([process.execPath, __filename, ...process.argv.slice(2)], 'h-test ' + args.join(' ')));
+function sh(cmd, o = {}) { return cp.execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...o }).trim(); }
+function shRaw(cmd, o = {}) { return cp.execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...o }); }
+function run(cmd, cwd, env) { const r = cp.spawnSync('bash', ['-lc', cmd], { cwd, encoding: 'utf8', env: { ...process.env, ...env } }); return { code: r.status, out: (r.stdout || '') + (r.stderr || '') }; }
+const root = sh('git rev-parse --show-toplevel');
+process.chdir(root);
+// D11: h-test is one of a package's own commands, so a run is its heartbeat (root is the worktree's
+// toplevel when run in one). h-queue beat never prints and exits 0; the cap bounds a stuck registry lock.
+if (runsTests) cp.spawnSync(process.execPath, [path.join(__dirname, 'h-queue'), 'beat', root], { stdio: 'ignore', timeout: 10000 });
+const cfgPath = path.join(root, '.holden', 'config.yaml');
+const cfg = fs.existsSync(cfgPath) ? yaml.load(cfgPath) : yaml.load(path.join(__dirname, '..', 'templates', 'config.yaml'));
+const tcfg = cfg.tests || {};
+const patterns = tcfg.test_file_patterns || ['tests/**'];
+const setup = tcfg.worktree_setup || [];
+function globToRe(g) {
+  let re = '';
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === '*') { if (g[i + 1] === '*') { if (g[i + 2] === '/') { re += '(?:.*/)?'; i += 2; } else { re += '.*'; i++; } } else re += '[^/]*'; }
+    else if (c === '?') re += '[^/]';
+    else if ('.+^${}()|[]\\'.includes(c)) re += '\\' + c;
+    else re += c;
+  }
+  return new RegExp('^' + re + '$');
+}
+const isTest = f => patterns.some(p => globToRe(p).test(f));
+// Fixtures sit under the test patterns so they travel with the test hunks to the parent, but a
+// runner handed a .bin or a fixtures/ file as a test path fails on it.
+const fixtures = tcfg.fixture_patterns || ['**/fixtures/**', '**/__snapshots__/**', '**/*.bin'];
+const isFixture = f => fixtures.some(p => globToRe(p).test(f));
+function log(m) { process.stdout.write(m + '\n'); }
+const ANSI = /\x1b\[[0-9;?]*[ -\/]*[@-~]/g;
+// holden works in any language: these defaults cover Python, JS/TS, Go, Rust and C/C++, and a repo
+// on anything else adds its own patterns in config (tests.summary, tests.missing_name). Never
+// replace the defaults with one stack's patterns.
+const extra = key => (Array.isArray(tcfg[key]) ? tcfg[key] : []).map(p => new RegExp(p));
+// The suite's own count lines, kept whatever prints after them (a deprecation warning pushed
+// vitest's counts out of a fixed tail).
+const SUMMARY_RES = [
+  /^\s*(?:Test Files|Test Suites|Tests):?\s+\d+ /,                                      // vitest, jest
+  /^\s*=+ .*\b(?:passed|failed|errors?|skipped|no tests ran)\b.*=+$/,                    // pytest
+  /^\s*\d+ (?:passed|failed|errors?|skipped|deselected)\b.* in [\d.]+s\b/, /^\s*no tests ran in /,
+  /^\s*\d+ tests? collected\b/,                                                         // pytest --collect-only -q
+  /^\s*\d+ (?:passing|failing|pending)\b/,                                               // mocha
+  /^# (?:tests|pass|fail) \d+$/,                                                        // node:test, TAP
+  /^(?:ok|FAIL)\s+\S+\s+(?:\(cached\)|[\d.]+s)/, /^FAIL$/,                                  // go test, one line per package
+  /^test result: (?:ok|FAILED)\. \d+ passed/, /^\s*Summary \[.*\] \d+ tests? run:/,             // cargo test, nextest
+  /^\d+% tests passed, \d+ tests? failed out of \d+/, /Synthesis: Tested: \d+/,              // ctest, criterion
+  ...extra('summary'),
+];
+// One line per package or binary can run to dozens (go test ./...): past ten, keep the lines
+// that are not plain passes and count the rest.
+function summaryOf(out) {
+  const lines = out.replace(ANSI, '').split('\n').filter(l => SUMMARY_RES.some(re => re.test(l))).map(l => l.trim());
+  if (lines.length <= 10) return lines;
+  const passes = lines.filter(l => /^ok\s/.test(l) || /^test result: ok\./.test(l));
+  const rest = lines.filter(l => !passes.includes(l));
+  return [...rest, `${passes.length} ${rest.length ? 'more ' : ''}passing lines (packages or test binaries)`];
+}
+// The name of each failing test, written into the record so a flake is named before a re-run
+// replaces the raw logs (holden 002). A repo adds `tests.failed`.
+const FAILED_RES = [
+  /^FAILED (\S+)/,                                                                      // pytest
+  /^\s*--- FAIL: (\S+)/,                                                                // go test
+  /^\s*not ok \d+ - (.+)$/,                                                             // node:test, TAP
+  /^\s*(?:×|✗|FAIL) (.+ > .+)$/,                                                        // vitest
+  /^\s*● (.+ › .+)$/,                                                                   // jest
+  /^test (\S+) \.\.\. FAILED$/,                                                         // cargo test
+  ...extra('failed'),
+];
+function failedOf(out) {
+  const names = [];
+  for (const l of out.replace(ANSI, '').split('\n')) {
+    for (const re of FAILED_RES) { const m = l.match(re); if (m) { const n = (m[1] || m[0]).trim(); if (!names.includes(n)) names.push(n); break; } }
+  }
+  return names.length <= 20 ? names : [...names.slice(0, 20), `+${names.length - 20} more`];
+}
+// A red caused by a name the parent lacks proves the name is new, not the behaviour.
+const MISSING_NAMES = [
+  /ImportError|ModuleNotFoundError|NameError|cannot import name|has no attribute/,          // Python
+  /is not defined|is not a function|Cannot find module|does not provide an export named/,   // JS
+  /Cannot find name '|has no exported member|Property '[^']+' does not exist on type/,      // TS
+  /undefined: \S|has no field or method|\[build failed\]/,                                 // Go
+  /error\[E0(?:412|422|423|425|432|433|599)\]|cannot find (?:value|function|type|struct|module|macro|crate) `|unresolved import|error: could not compile `/, // Rust
+  /was not declared in this scope|undeclared \(first use|implicit declaration of function|undefined reference to|fatal error: \S+: No such file or directory|has no member named/, // C, C++
+  ...extra('missing_name'),
+];
+const MISSING_NAME = { test: s => MISSING_NAMES.some(re => re.test(s)) };
+function record(obj) { const line = JSON.stringify({ time: new Date().toISOString(), ...obj }); if (opt.ledger) fs.appendFileSync(opt.ledger, 'h-test: ' + line + '\n'); log('h-test: ' + line); }
+const stampIgnore = tcfg.stamp_ignore || ['.planning/**', '.holden/**', 'docs/**', '**/*.md'];
+// A pattern starting with '!' re-includes what an earlier pattern ignored (data a test reads
+// under docs/, say); patterns are applied in order and the last match wins.
+function stampIgnored(f) {
+  let ignored = false;
+  for (const g of stampIgnore) {
+    const neg = g.startsWith('!');
+    if (globToRe(neg ? g.slice(1) : g).test(f)) ignored = !neg;
+  }
+  return ignored;
+}
+function codeTreeHash(ref) {
+  // hash of the tracked tree at ref, ignoring paths that cannot change behaviour (docs, planning)
+  const lines = shRaw(`git ls-tree -r ${ref}`, { maxBuffer: 1 << 28 }).split('\n').filter(Boolean);
+  const keep = lines.filter(l => { const f = l.split('\t')[1]; return !stampIgnored(f); });
+  return crypto.createHash('sha256').update(keep.join('\n')).digest('hex');
+}
+function dirtyHash() {
+  // Uncommitted state that could change behaviour: paths matching stamp_ignore (docs, planning,
+  // this script's own --ledger log) are left out, the same way codeTreeHash leaves them out.
+  const ignored = stampIgnored;
+  const changed = sh('git diff HEAD --name-only').split('\n').filter(f => f && !ignored(f));
+  const diff = changed.length ? sh(`git diff HEAD --binary -- ${changed.map(f => `'${f}'`).join(' ')}`) : '';
+  const untracked = sh('git ls-files --others --exclude-standard').split('\n').filter(f => f && !ignored(f));
+  if (!diff && !untracked.length) return '';
+  const h = crypto.createHash('sha256'); h.update(diff);
+  for (const f of untracked) { h.update('\0' + f + '\0'); try { h.update(fs.readFileSync(f)); } catch (e) {} }
+  return h.digest('hex');
+}
+
+const rules = tcfg.targeted || [{ match: '**', run: 'pytest {files} -q' }];
+function commandsFor(files) {
+  const groups = [];
+  for (const r of rules) { const fs_ = files.filter(f => globToRe(r.match).test(f)); if (fs_.length) groups.push({ rule: r, files: fs_ }); }
+  const covered = new Set(groups.flatMap(g => g.files)); const missing = files.filter(f => !covered.has(f));
+  if (missing.length) { console.error('no tests.targeted rule matches: ' + missing.join(', ')); process.exit(2); }
+  return groups.map(g => g.rule.run.replace(/\{files\}/g, g.files.join(' ')).replace(/\{files_rel:([^}]+)\}/g, (_, pre) => g.files.map(f => f.startsWith(pre) ? f.slice(pre.length) : f).join(' ')));
+}
+if (opt.run) {
+  // --run: the targeted commands for the named tests, in the current tree, no proof. h-worktree
+  // land uses it to re-run a plan's proved tests on the merged tree.
+  if (!opt.tests.length) { console.error('--run needs --tests'); process.exit(2); }
+  let code = 0; const results = [];
+  for (const c of commandsFor(opt.tests)) { log('h-test --run: ' + c); const r = run(c, root, {}); const summary = summaryOf(r.out); results.push({ cmd: c, code: r.code, summary }); process.stdout.write(r.out.split('\n').slice(-15).join('\n') + '\n'); if (summary.length) log('summary: ' + summary.join(' | ')); if (r.code !== 0) code = r.code; }
+  record({ run: code === 0 ? 'pass' : 'fail', tree: sh('git rev-parse HEAD'), tests: opt.tests, results });
+  process.exit(code === 0 ? 0 : 1);
+}
+if (opt.deps) {
+  // --deps: a dependency manifest changed, so check the dependency set resolves and the code
+  // still builds and collects, in seconds, before the full suite finds it an hour later.
+  // Each tests.deps rule runs from the directory of the manifest it matched,
+  // since a subproject carries its own.
+  const deps = tcfg.deps || [];
+  const files = opt.deps.length ? opt.deps : [...new Set([...sh('git diff HEAD --name-only').split('\n'), ...sh('git ls-files --others --exclude-standard').split('\n')])].filter(Boolean);
+  const jobs = [];
+  for (const f of files) for (const r of deps) if (globToRe(r.match).test(f)) jobs.push({ file: f, rule: r });
+  if (!jobs.length) { log(`h-test --deps: no tests.deps rule matches ${files.length ? files.join(', ') : 'any changed file'}${deps.length ? '' : ' (tests.deps is empty)'}`); process.exit(0); }
+  let code = 0;
+  for (const { file, rule } of jobs) {
+    const cwd = path.join(root, path.dirname(file));
+    log(`h-test --deps: ${file}: ${rule.run} (in ${path.dirname(file)})`);
+    const r = run(rule.run, cwd, {});
+    process.stdout.write(r.out.split('\n').slice(-15).join('\n') + '\n');
+    const counted = rule.count ? r.out.replace(ANSI, '').split('\n').filter(l => new RegExp(rule.count).test(l)).length : null;
+    record({ deps: file, cmd: rule.run, code: r.code, summary: summaryOf(r.out), ...(counted === null ? {} : { counted }) });
+    if (r.code !== 0) code = r.code;
+  }
+  process.exit(code === 0 ? 0 : 1);
+}
+if (args.includes('--code-tree')) { process.stdout.write(codeTreeHash(opt.commit || 'HEAD') + '\n'); process.exit(0); }
+if (opt.full) {
+  const cmds = tcfg.full || ['pytest -q'];
+  const results = [];
+  // D14: the stamp names the code tree that was tested, so a landing or an edit of a code file during the run stamps nothing.
+  const sha0 = sh('git rev-parse HEAD'), dirty0 = dirtyHash();
+  for (const c of cmds) { log('h-test --full: ' + c); const r = run(c, root, {}); const summary = summaryOf(r.out); const failed = r.code !== 0 ? failedOf(r.out) : []; results.push({ cmd: c, code: r.code, summary, ...(r.code !== 0 ? { failed } : {}) }); process.stdout.write(r.out.split('\n').slice(-15).join('\n') + '\n'); if (summary.length) log('summary: ' + summary.join(' | ')); if (failed.length) log('failed: ' + failed.join(' | ')); if (r.code !== 0) { record({ full: 'fail', results }); process.exit(1); } }
+  const sha1 = sh('git rev-parse HEAD'), dirty1 = dirtyHash();
+  // Compared by code tree, not sha: a commit touching only stamp_ignore paths (a .planning/
+  // metadata transaction) changes nothing the suite saw (quick 261021 D01).
+  const tree0 = codeTreeHash(sha0), tree1 = codeTreeHash(sha1);
+  if (tree1 !== tree0 || dirty1 !== dirty0) { record({ full: 'fail', reason: 'the tree changed during the run; nothing stamped', before: { sha: sha0, dirty: dirty0 }, after: { sha: sha1, dirty: dirty1 }, results }); process.exit(1); }
+  // Built from what was compared, never a fresh read: a move after the compare must not reach the stamp.
+  // sha1 is the newest commit whose code tree the compare read; skills/h-execute/SKILL.md writes it as tested:.
+  const stamp = { sha: sha1, code_tree: tree1, dirty: dirty0, time: new Date().toISOString(), commands: cmds };
+  fs.mkdirSync(path.join(root, '.holden'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.holden', 'test-stamp'), JSON.stringify(stamp, null, 2) + '\n');
+  record({ full: 'pass', stamp, results });
+  process.exit(0);
+}
+
+if (opt.scratch) {
+  // --scratch: any run at another commit that a proof needs and the red/green proof cannot
+  // express (a parent plus only some cases, a script's output at the base). Executors may not
+  // make worktrees themselves (hooks/holden-executor-git-guard.js); this one is pid-named,
+  // set up, recorded and removed like a proof worktree, and reaped if this process is killed.
+  if (!scratchCmd) { console.error('--scratch needs -- <command>'); process.exit(2); }
+  let ref; try { ref = sh(`git rev-parse --verify ${opt.scratch}^{commit}`); } catch (e) { console.error('not a commit: ' + opt.scratch); process.exit(2); }
+  const lib = require(path.join(__dirname, '..', 'lib', 'worktrees.js'));
+  lib.reapDeadProofs(root);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `h-test-wt-${process.pid}-`));
+  sh(`git worktree add --detach "${d}" ${ref}`);
+  process.on('exit', () => { try { sh(`git worktree remove --force "${d}"`); } catch (e) {} try { sh('git worktree prune'); } catch (e) {} });
+  for (const c of setup) { const r = run(c, d, { REPO: root }); if (r.code !== 0) { console.error(`setup failed: ${c}\n${r.out}`); process.exit(2); } }
+  if (opt.patch) {
+    const r = cp.spawnSync('git', ['apply', '--whitespace=nowarn', opt.patch], { cwd: d, encoding: 'utf8' });
+    if (r.status !== 0) { console.error('could not apply the patch at ' + ref.slice(0, 7) + ': ' + r.stderr); process.exit(2); }
+  }
+  const r = run(scratchCmd, d, {});
+  const tail = r.out.split('\n').filter(Boolean).slice(-12);
+  log(`--- scratch at ${ref.slice(0, 7)}${opt.patch ? ' + ' + opt.patch : ''}: ${scratchCmd} ---\n` + tail.join('\n'));
+  record({ scratch: ref, patch: opt.patch || null, cmd: scratchCmd, code: r.code, tail: tail.slice(-4) });
+  process.exit(r.code === 0 ? 0 : 1);
+}
+const stashBefore = sh('git stash list');
+const treeDirty = sh('git status --porcelain') !== '';
+let C, temp = false;
+if (opt.uncommitted || (!opt.commit && treeDirty)) {
+  const idx = path.join(os.tmpdir(), 'h-test-index-' + process.pid);
+  const env = { GIT_INDEX_FILE: idx };
+  sh('git read-tree HEAD', { env: { ...process.env, ...env } });
+  sh('git add -A', { env: { ...process.env, ...env } });
+  const tree = sh('git write-tree', { env: { ...process.env, ...env } });
+  C = sh(`git commit-tree ${tree} -p HEAD -m "h-test temporary commit"`);
+  try { fs.unlinkSync(idx); } catch (e) {}
+  temp = true;
+} else C = sh(`git rev-parse ${opt.commit || 'HEAD'}`);
+let P; try { P = sh(`git rev-parse ${C}^`); } catch (e) { console.error('commit has no parent'); process.exit(1); }
+const changed = sh(`git diff --name-only ${P} ${C}`).split('\n').filter(Boolean);
+const testFiles = changed.filter(isTest), codeFiles = changed.filter(f => !isTest(f));
+const targets = opt.tests.length ? opt.tests : testFiles.filter(f => !isFixture(f));
+if (changed.length === 0) { console.error('nothing changed between ' + P.slice(0, 7) + ' and ' + C.slice(0, 7)); process.exit(1); }
+if (targets.length === 0) { record({ verdict: 'refused', reason: 'no test file changed and none named with --tests', commit: C, code_files: codeFiles }); process.exit(1); }
+if (!opt.refactor && testFiles.length === 0) { record({ verdict: 'refused', reason: 'no test changed by this commit; add a test, or use --refactor for a behaviour-preserving change', commit: C }); process.exit(1); }
+const cmds = commandsFor(targets);
+const wts = [];
+require(path.join(__dirname, '..', 'lib', 'worktrees.js')).reapDeadProofs(root);
+function worktree(ref) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `h-test-wt-${process.pid}-`));
+  sh(`git worktree add --detach "${d}" ${ref}`); wts.push(d);
+  for (const s of setup) run(s, d, { REPO: root });
+  return d;
+}
+function cleanup() { for (const d of wts) { try { sh(`git worktree remove --force "${d}"`); } catch (e) {} } try { sh('git worktree prune'); } catch (e) {} }
+process.on('exit', cleanup);
+function runAll(cwd) { let out = '', full = '', code = 0; for (const c of cmds) { const r = run(c, cwd, {}); out += `$ ${c}\n` + r.out.split('\n').slice(-12).join('\n') + '\n'; full += r.out.replace(ANSI, '') + '\n'; if (r.code !== 0) code = r.code; } return { code, out, full }; }
+
+// RED (or GREEN for --refactor) at P with only the test hunks applied
+const wtP = worktree(P);
+if (testFiles.length) { const patch = shRaw(`git diff --binary ${P} ${C} -- ${testFiles.map(f => `"${f}"`).join(' ')}`, { maxBuffer: 1 << 26 }); const r = cp.spawnSync('git', ['apply', '--whitespace=nowarn', '-'], { cwd: wtP, input: patch, encoding: 'utf8' }); if (r.status !== 0) { console.error('could not apply test hunks at parent: ' + r.stderr); process.exit(1); } }
+const atP = runAll(wtP);
+log(`--- at parent ${P.slice(0, 7)} with test hunks only ---\n` + atP.out);
+if (!opt.refactor && atP.code === 0) { record({ verdict: 'refused', reason: 'tests pass without the change: the test does not depend on it', commit: C, parent: P, tests: targets }); process.exit(1); }
+const redAtParent = opt.refactor ? null : atP.out.replace(ANSI, '').split('\n').filter(l => l.trim()).slice(-4);
+const redOnMissingName = !opt.refactor && MISSING_NAME.test(atP.full);
+if (redOnMissingName) log('warning: the parent went red on a missing name, not on the asserted behaviour; prove the behaviour by mutation with --scratch');
+if (opt.refactor && atP.code !== 0) { record({ verdict: 'failed', reason: '--refactor but tests fail at parent', commit: C, parent: P, tests: targets }); process.exit(1); }
+// GREEN at C
+let cwdC = root;
+if (temp || C !== sh('git rev-parse HEAD') || treeDirty) cwdC = worktree(C);
+const atC = runAll(cwdC);
+log(`--- at ${temp ? 'working tree (temp commit ' : 'commit ('}${C.slice(0, 7)}) ---\n` + atC.out);
+if (atC.code !== 0) { record({ verdict: 'failed', reason: 'tests fail with the change', commit: C, parent: P, tests: targets }); process.exit(1); }
+// Readers: a test that reads a changed file by name as text (a doc parser, a source regex) is
+// not in the proof, and only the full suite found one. Run, at C, every
+// test file holding a changed file's basename as a quoted path; one red at C and green at P fails.
+const readers = (() => {
+  const found = new Set();
+  for (const f of codeFiles) {
+    const b = path.basename(f).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const r = cp.spawnSync('git', ['grep', '-l', '-I', '-E', `['"/]${b}['"]`, C], { encoding: 'utf8', maxBuffer: 1 << 26 });
+    for (const l of (r.stdout || '').split('\n')) { const t = l.slice(C.length + 1); if (t && isTest(t) && !isFixture(t) && !targets.includes(t) && rules.some(x => globToRe(x.match).test(t))) found.add(t); }
+  }
+  return [...found].sort();
+})();
+let readersRedBefore = [];
+if (readers.length) {
+  let anyRed = false;
+  for (const c of commandsFor(readers)) { const r = run(c, cwdC, {}); log(`--- readers at ${C.slice(0, 7)}: ${c} ---\n` + r.out.split('\n').slice(-12).join('\n')); if (r.code !== 0) anyRed = true; }
+  // A runner reports per command, so a red is narrowed file by file; a reader red at the
+  // parent too was red before this change: deferred, not this proof's.
+  const red = anyRed ? readers.filter(t => run(commandsFor([t])[0], cwdC, {}).code !== 0) : [];
+  if (red.length) {
+    const before = red.filter(t => run(commandsFor([t])[0], wtP, {}).code !== 0);
+    const caused = red.filter(t => !before.includes(t));
+    if (caused.length) { record({ verdict: 'failed', reason: 'a test that reads a changed file by name fails with the change', commit: C, parent: P, tests: targets, readers_red: caused }); process.exit(1); }
+    readersRedBefore = before;
+  }
+}
+if (sh('git stash list') !== stashBefore) { console.error('stash list changed during h-test; this must never happen'); process.exit(1); }
+record({ verdict: opt.refactor ? 'proved-refactor' : 'proved', commit: C, parent: P, tests: targets, code_files: codeFiles, commands: cmds, readers, ...(readersRedBefore.length ? { readers_red_before: readersRedBefore } : {}), ...(opt.refactor ? {} : { red_at_parent: redAtParent, red_on_missing_name: redOnMissingName }) });
+process.exit(0);

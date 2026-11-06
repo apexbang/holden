@@ -1,0 +1,6 @@
+# gaps recorded from other repos: local to the machine, never in this repo
+observations.md
+reviews/h-audit/
+# holden's own run output (test stamp, full-suite logs); config is tracked
+.holden/*
+!.holden/config.yaml

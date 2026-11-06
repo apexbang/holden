@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Stop hook: block ending a turn while a registered detached run is finished-but-unread,
+# or running with no live waiter to wake Claude. Only the session that launched a run is
+# blocked for it: detach records `session=` in the .run file, and the hook's stdin carries
+# this session's session_id. A run with no recorded session (an old registration)
+# still alerts every session.
+R=$HOME/.claude/detached
+# This session's ids: the hook's session_id and its transcript's file name (both, so a
+# difference between the two can never hide this session's own runs from it).
+me=$(python3 -c 'import json,os,sys
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+tp = os.path.basename(d.get("transcript_path") or "")
+print(d.get("session_id") or "", tp[:-6] if tp.endswith(".jsonl") else "")' 2>/dev/null)
+read -r me_id me_tr <<< "$me"
+shopt -s nullglob
+msgs=()
+for run in "$R"/*.run; do
+  name=$(basename "$run" .run)
+  [ -e "$R/$name.seen" ] && continue
+  owner=$(sed -n 's/^session=//p' "$run" | head -1)
+  if [ -n "$owner" ] && { [ -n "$me_id" ] || [ -n "$me_tr" ]; } \
+     && [ "$owner" != "$me_id" ] && [ "$owner" != "$me_tr" ]; then continue; fi
+  out=$R/$name.out
+  if grep -q '^EXIT ' "$out" 2>/dev/null; then
+    msgs+=("'$name' FINISHED ($(grep '^EXIT ' "$out" | tail -1)). Read $out now, act on the result, then run: detach-seen $name")
+  else
+    pid=$(cat "$R/$name.waiter" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      msgs+=("'$name' is RUNNING with no live waiter. Arm one as a background Bash task: detach-wait $name")
+    fi
+  fi
+done
+[ ${#msgs[@]} -eq 0 ] && exit 0
+printf '%s\n' "${msgs[@]}" | python3 -c 'import json,sys; print(json.dumps({"decision":"block","reason":"Detached runs need attention:\n"+sys.stdin.read()}))'

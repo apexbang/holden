@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+# PreToolUse(Bash) hook: a codex review, a codex consult or a full suite must be launched through ~/.claude/bin/detach,
+# so it survives the harness watchdog and the Stop hook tracks it to a read result.
+import json, re, sys
+try:
+    cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
+except Exception:
+    sys.exit(0)
+# Only an invocation counts: the name at a command position or after a path, not quoted in prose.
+POS = r"(?:^|[\s;&|(/\"'])"
+long_run = re.search(POS + r"codex-(?:review|ask)\s+--(?!help)", cmd) or re.search(POS + r"h-test\s+--full", cmd)
+if not long_run or "--dry-run" in cmd:
+    sys.exit(0)
+if re.search(r"(^|[\s;&|(])(\S*/)?detach\s+\S+\s", cmd):
+    sys.exit(0)
+print(json.dumps({"hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": (
+        "Long runs (codex-review, codex-ask, h-test --full) go through detach, never inline or hand-rolled nohup. "
+        "Run: ~/.claude/bin/detach <name> \"<command>\"  then in the SAME response a background Bash task: "
+        "~/.claude/bin/detach-wait <name> 1800 (codex can take 25 min). On wake: read the output, act on the "
+        "EXIT code, then ~/.claude/bin/detach-seen <name>.")}}))

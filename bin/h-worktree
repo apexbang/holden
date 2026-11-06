@@ -1,0 +1,356 @@
+#!/usr/bin/env node
+'use strict';
+// h-worktree: the one owner of executor worktrees and holden/* branches. Executors never create,
+// merge, switch or delete branches or worktrees; the orchestrator calls this.
+//   h-worktree preflight                         one throwaway worktree at HEAD: setup + worktrees.smoke
+//   h-worktree add <NNN-NN> [--base <ref>]       branch holden/<id> and its worktree; prints the path
+//   h-worktree range <NNN-NN>                    base..head of the plan's branch, refused when empty
+//   h-worktree land <id> --ledger <file> [--head <sha>] [--also-tests f...]   under the repo's landing lock: merge the head SHA in a throwaway worktree, re-run the ledger's proved tests and --also-tests there, fast-forward the main branch only onto the HEAD read under the lock
+//   h-worktree drop <id> --ledger <file> --reason <text> [--save-patch]   record the head, delete the branch; with --save-patch, uncommitted work is saved as a checked patch beside the ledger first
+//   h-worktree remove <NNN-NN>                   remove a landed plan's worktree and merged branch
+//   h-worktree check <NNN>                       exit 1 while any holden/<NNN>-* branch or worktree, or a registry package of the phase not landed, remains
+//   h-worktree list | sweep [--dry-run]
+// Worktrees live in ~/.cache/holden/wt/<repo>-<hash>/, never in the repo or /tmp. Nothing here
+// forces: a worktree with uncommitted work is refused and listed by `remove` and `sweep`. The
+// exceptions are the throwaway _land-*, _preflight-* and _drop-* checkouts this script makes itself,
+// and `drop`, whose `branch -D` (and, with --save-patch, `worktree remove --force`) run only after
+// the head hash is in the ledger and, for uncommitted work, a patch is written beside it and checked
+// at that head.
+// Exit: 0 ok, 1 refused or failed, 2 usage, 3 merge conflict, 4 red on the merged tree,
+// 5 the main branch moved while landing (land again), 6 the fast-forward was refused: the main
+// checkout has uncommitted changes to files the plan changes (stop; landing again cannot help),
+// 75 the test mutex stayed busy for 9 minutes (preflight or land again), or the landing lock
+// stayed busy (land again).
+const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process'), crypto = require('crypto');
+const yaml = require(path.join(__dirname, '..', 'lib', 'yaml-lite.js'));
+const wt = require(path.join(__dirname, '..', 'lib', 'worktrees.js'));
+const machine = require(path.join(__dirname, '..', 'lib', 'machine.js'));
+const registry = require(path.join(__dirname, '..', 'lib', 'registry.js'));
+const meta = require(path.join(__dirname, '..', 'lib', 'meta.js'));
+
+const args = process.argv.slice(2);
+const cmd = args[0], id = args[1] && !args[1].startsWith('--') ? args[1] : null;
+const flag = name => { const i = args.indexOf(name); return i < 0 ? null : (args[i + 1] || ''); };
+// The --tests loop of bin/h-test: every word after the flag up to the next flag.
+const list = name => { const i = args.indexOf(name); if (i < 0) return []; const out = []; for (let j = i + 1; j < args.length && !args[j].startsWith('--'); j++) out.push(args[j]); return out; };
+const dry = args.includes('--dry-run');
+if (!cmd || cmd === '-h' || cmd === '--help') { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 23).join('\n')); process.exit(cmd ? 0 : 2); }
+
+function sh(c, o = {}) { return cp.execSync(c, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...o }).trim(); }
+function trySh(c, o = {}) { try { return { ok: true, out: sh(c, o) }; } catch (e) { return { ok: false, out: ((e.stdout || '') + (e.stderr || '')).trim() }; } }
+function run(c, cwd, env) { const r = cp.spawnSync('bash', ['-lc', c], { cwd, encoding: 'utf8', env: { ...process.env, ...env } }); return { code: r.status, out: (r.stdout || '') + (r.stderr || '') }; }
+function die(msg, code = 1) { console.error('h-worktree: ' + msg); process.exit(code); }
+const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// Always the main checkout, even when called from inside a worktree.
+const root = path.dirname(sh('git rev-parse --path-format=absolute --git-common-dir'));
+const git = (c, o = {}) => sh(`git -C ${q(root)} ${c}`, o);
+const cfgPath = path.join(root, '.holden', 'config.yaml');
+const cfg = fs.existsSync(cfgPath) ? yaml.load(cfgPath) : {};
+const setup = (cfg.tests || {}).worktree_setup || [], smoke = (cfg.worktrees || {}).smoke || null;
+const cache = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+// git records a worktree by its real path; a symlinked ~/.cache would otherwise match nothing.
+const BASE = (() => { const b = path.join(cache, 'holden', 'wt', `${path.basename(root)}-${crypto.createHash('sha1').update(fs.realpathSync(root)).digest('hex').slice(0, 8)}`); fs.mkdirSync(b, { recursive: true }); return fs.realpathSync(b); })();
+const branchOf = i => `holden/${i}`, dirOf = i => path.join(BASE, i);
+const mainBranch = () => { const r = trySh(`git -C ${q(root)} symbolic-ref --short HEAD`); if (!r.ok) die('the main checkout is not on a branch'); return r.out; };
+const exists = ref => trySh(`git -C ${q(root)} rev-parse --verify --quiet ${q(ref)}`).ok;
+const registered = () => wt.listWorktrees(root);
+const holdenBranches = () => git(`for-each-ref --format='%(refname:short)' refs/heads/holden/`).split('\n').filter(Boolean);
+// The ids bin/h-queue admit accepts: a plan id, a quick dir name, an inline fix id.
+function needId() { if (!id || !/^[A-Za-z0-9][\w.-]*$/.test(id)) die('need a package id like 012-05, 261018-slug or 012-fix1', 2); }
+// Setup commands must succeed here: a worktree that failed setup would fail its tests for the wrong reason.
+// What setup leaves untracked (a node_modules symlink the repo's `node_modules/` pattern does not
+// ignore, say) is recorded in the worktree's own git dir, so it neither counts as the executor's
+// uncommitted work nor blocks `git worktree remove`.
+const setupRecord = dir => path.join(sh(`git -C ${q(dir)} rev-parse --path-format=absolute --git-dir`), 'holden-setup-paths');
+const untracked = dir => sh(`git -C ${q(dir)} status --porcelain --untracked-files=normal`).split('\n').filter(l => l.startsWith('?? ')).map(l => l.slice(3));
+function runSetup(dir) {
+  for (const s of setup) { const r = run(s, dir, { REPO: root }); if (r.code !== 0) return `setup failed: ${s}\n${r.out.trim()}`; }
+  fs.writeFileSync(setupRecord(dir), untracked(dir).join('\n'));
+  return null;
+}
+function setupPaths(dir) { try { return fs.readFileSync(setupRecord(dir), 'utf8').split('\n').filter(Boolean); } catch (e) { return []; } }
+function dirty(dir) {
+  const r = trySh(`git -C ${q(dir)} status --porcelain`); if (!r.ok) return 'cannot read status';
+  const mine = new Set(setupPaths(dir).map(p => '?? ' + p));
+  return r.out.split('\n').filter(l => l && !mine.has(l)).join('\n');
+}
+// Only paths setup itself created, and only inside the worktree: a symlink is unlinked, never followed.
+function clearSetup(dir) {
+  for (const p of setupPaths(dir)) {
+    const f = path.join(dir, p.replace(/\/$/, ''));
+    if (!f.startsWith(dir + path.sep)) continue;
+    try { fs.rmSync(f, { recursive: !fs.lstatSync(f).isSymbolicLink(), force: true }); } catch (e) {}
+  }
+}
+// The throwaway checkouts carry their owner's pid so sweep can tell a live one from a leftover.
+function scratch(kind, ref) {
+  const d = path.join(BASE, `_${kind}-${process.pid}`);
+  fs.mkdirSync(BASE, { recursive: true });
+  git(`worktree add --detach ${q(d)} ${ref}`);
+  process.on('exit', () => { trySh(`git -C ${q(root)} worktree remove --force ${q(d)}`); });
+  return d;
+}
+// D11: h-worktree is one of a package's own commands, so a call is its heartbeat. h-queue beat
+// never prints and exits 0; the cap bounds a stuck registry lock.
+const beat = () => { if (id) cp.spawnSync(process.execPath, [path.join(__dirname, 'h-queue'), 'beat', dirOf(id)], { stdio: 'ignore', timeout: 10000 }); };
+// The last `Dropped:` line drop wrote for branch b into this ledger: { head, patch path or null }.
+function lastDropped(ledger, b) {
+  const pre = `Dropped: ${b} at `;
+  const line = fs.readFileSync(ledger, 'utf8').split('\n').filter(l => l.startsWith(pre)).pop();
+  const h = line && line.slice(pre.length).match(/^[0-9a-f]{40,64}\b/);
+  if (!h) return null;
+  const p = line.match(/, apply with: git apply (.+)$/);
+  return { head: h[0], patch: p ? p[1] : null };
+}
+function removeWorktree(i) {
+  const d = dirOf(i);
+  if (registered().some(w => w.worktree === d)) {
+    const dd = dirty(d); if (dd) return `worktree ${d} has uncommitted work, left in place:\n${dd}`;
+    clearSetup(d);
+    const r = trySh(`git -C ${q(root)} worktree remove ${q(d)}`); if (!r.ok) return r.out;
+  }
+  return null;
+}
+
+if (cmd === 'preflight') {
+  const d = scratch('preflight', 'HEAD');
+  const bad = runSetup(d); if (bad) die(bad);
+  if (!smoke) { console.log('preflight: setup ok; no worktrees.smoke in .holden/config.yaml, nothing run'); process.exit(0); }
+  // D06: the smoke is a test run, so it waits for the machine-wide test mutex like every other.
+  const r = machine.runUnderMutex(smoke, d, { REPO: root }, 'preflight');
+  if (r.code === 75) die('the test mutex stayed busy for 9 minutes; run preflight again', 75);
+  console.log(`preflight: ${smoke}\n` + r.out.split('\n').slice(-15).join('\n'));
+  if (r.code !== 0) die('smoke failed in a fresh worktree: the repo cannot run plans in parallel until it passes');
+  console.log('preflight: ok'); process.exit(0);
+}
+
+if (cmd === 'add') {
+  beat(); needId(); const b = branchOf(id), d = dirOf(id);
+  const mine = registered().find(w => w.worktree === d);
+  if (mine) { if (mine.branch !== `refs/heads/${b}`) die(`${d} is registered on ${mine.branch || 'a detached HEAD'}, not ${b}`); console.log('resumed'); console.log(d); process.exit(0); }
+  if (exists(`refs/heads/${b}`)) die(`branch ${b} exists with no worktree: a leftover; drop it or run sweep`);
+  if (fs.existsSync(d)) die(`${d} exists but is not a registered worktree; look at it, then remove it by hand`);
+  fs.mkdirSync(BASE, { recursive: true });
+  git(`worktree add -b ${q(b)} ${q(d)} ${q(flag('--base') || 'HEAD')}`);
+  const bad = runSetup(d);
+  if (bad) { trySh(`git -C ${q(root)} worktree remove --force ${q(d)}`); trySh(`git -C ${q(root)} branch -D ${q(b)}`); die(bad); }
+  console.log(d); process.exit(0);
+}
+
+function range() {
+  const b = branchOf(id); if (!exists(`refs/heads/${b}`)) die(`no branch ${b}`);
+  const head = git(`rev-parse ${q(b)}`), base = git(`merge-base ${q(mainBranch())} ${q(b)}`);
+  if (git(`rev-list --count ${base}..${head}`) === '0') die(`empty range ${base.slice(0, 7)}..${head.slice(0, 7)}: nothing was committed on ${b}`);
+  return { base, head };
+}
+if (cmd === 'range') { beat(); needId(); const r = range(); console.log(`${r.base}..${r.head}`); process.exit(0); }
+
+if (cmd === 'land') {
+  beat(); needId(); const ledger = flag('--ledger'); if (!ledger || !fs.existsSync(ledger)) die('land needs --ledger <file>', 2);
+  const headArg = flag('--head');
+  if (headArg !== null && !/^[0-9a-f]{7,40}$/i.test(headArg)) die('--head needs a commit sha', 2);
+  // D07: one landing at a time per repo, held from the candidate merge through its tests to the
+  // fast-forward. bin/h-queue land holds the lock itself and passes HOLDEN_LANDING_HELD=1. -o closes
+  // the lock fd before node starts, so a server a test leaves running does not keep the lock; flock
+  // itself holds it until this re-run exits. 175 is flock's own timeout, told apart from the re-run's codes.
+  if (process.env.HOLDEN_LANDING_HELD !== '1') {
+    const lk = registry.paths(root).landingLock; fs.closeSync(fs.openSync(lk, 'a'));
+    const r = cp.spawnSync('flock', ['-w', '14400', '-E', '175', '-o', lk, process.execPath, __filename, ...args], { stdio: 'inherit', env: { ...process.env, HOLDEN_LANDING_HELD: '1' } });
+    if (r.error) die('could not run flock for the landing lock: ' + r.error.message);
+    if (r.status === 175) die('the landing lock stayed busy for 4 hours; land again', 75);
+    process.exit(r.status === null ? 1 : r.status);
+  }
+  // Phase 002 D01: a pending metadata journal is replayed here, under the lock and before T is
+  // read, so the fast-forward below never runs over a main index a killed meta commit left stale.
+  try { for (const l of meta.replayJournal(root)) console.log(l); } catch (e) { die(e.message); }
+  const b = branchOf(id), d = dirOf(id), target = mainBranch(), T = git('rev-parse HEAD');
+  if (registered().some(w => w.worktree === d)) { const dd = dirty(d); if (dd) die(`${d} has uncommitted work; the executor did not commit it:\n${dd}`); }
+  const hasBranch = exists(`refs/heads/${b}`);
+  let head = null;
+  if (headArg) { const h = trySh(`git -C ${q(root)} rev-parse --verify --quiet ${q(headArg + '^{commit}')}`); if (!h.ok) die(`no commit ${headArg}`); head = h.out; }
+  else if (hasBranch) head = git(`rev-parse ${q(b)}`);
+  // The head is in the message, so a landing is found on the main branch by what was merged, with
+  // or without the branch (bin/h-queue land's recovery greps the same text).
+  const msg = `merge(${id}): land ${b}${head ? ' ' + head.slice(0, 7) : ''}`;
+  // Landed already (an earlier land stopped after the fast-forward, and its cleanup may have deleted
+  // the branch): finish the ledger line and the cleanup. A branch that moved on since is a new landing.
+  const landedBy = trySh(`git -C ${q(root)} log --merges -1 --format=%h --fixed-strings --grep=${q(msg)} ${q(target)}`);
+  if (landedBy.ok && landedBy.out && !(hasBranch && !trySh(`git -C ${q(root)} merge-base --is-ancestor ${q(b)} ${q(target)}`).ok)) {
+    const h7 = head ? head.slice(0, 7) : git(`rev-parse --short ${q(landedBy.out + '^2')}`);
+    if (!fs.readFileSync(ledger, 'utf8').includes(`Landed: ${b} `)) fs.appendFileSync(ledger, `Landed: ${b} ${h7} as ${landedBy.out} on ${target}, found at a second land; the first stopped after its fast-forward\n`);
+    console.log(`already landed as ${landedBy.out}`);
+    const kept = removeWorktree(id);
+    if (kept) console.log('already landed; ' + kept);
+    else if (hasBranch) { const del = trySh(`git -C ${q(root)} branch -d ${q(b)}`); console.log(del.ok ? `already landed; removed ${b}` : 'already landed; branch kept: ' + del.out); }
+    console.log('landed-tests: []');
+    process.exit(0);
+  }
+  if (headArg && hasBranch && git(`rev-parse ${q(b)}`) !== head) die(`${b} moved past the submitted head ${head.slice(0, 7)}; submit again`, 1);
+  range();
+  const L = scratch('land', T);
+  const bad = runSetup(L); if (bad) die(bad);
+  // D07: the SHA captured at submission, never the branch name, which may move under the landing.
+  const m = trySh(`git -C ${q(L)} merge --no-ff --no-edit -m ${q(msg)} ${head}`);
+  if (!m.ok) {
+    const files = trySh(`git -C ${q(L)} diff --name-only --diff-filter=U`).out;
+    trySh(`git -C ${q(L)} merge --abort`);
+    console.log(`conflict merging ${b} ${head.slice(0, 7)} onto ${target} ${T.slice(0, 7)}:\n${files || m.out}`);
+    process.exit(3);
+  }
+  const M = sh(`git -C ${q(L)} rev-parse HEAD`);
+  registry.crashAt('land-after-merge');
+  // D08: the ledger's proved tests plus those of every package landed since the base (bin/h-queue
+  // land passes them as --also-tests). A test deleted since is skipped and named in the landing line.
+  const also = list('--also-tests');
+  const all = [...new Set([...registry.ledgerTests(ledger), ...also])];
+  const missing = all.filter(t => !fs.existsSync(path.join(L, t)));
+  const tests = all.filter(t => !missing.includes(t));
+  const skipped = missing.length ? `; skipped missing: ${missing.join(', ')}` : '';
+  if (tests.length) {
+    const r = run(`${q(path.join(__dirname, 'h-test'))} --run --ledger ${q(path.resolve(ledger))} --tests ${tests.map(q).join(' ')}`, L, {});
+    // h-test exits 75 when the test mutex stayed busy: nothing was run, so it is not red.
+    if (r.code === 75) { console.log(r.out.split('\n').slice(-3).join('\n')); die('the test mutex stayed busy for 9 minutes; land again', 75); }
+    console.log(r.out.split('\n').slice(-8).join('\n'));
+    if (r.code !== 0) { console.log(`red on the merged tree ${M.slice(0, 7)}; ${target} not moved`); process.exit(4); }
+  } else console.log(`no proved tests ${missing.length ? 'left on the merged tree' : 'in the ledger'}: the merged tree is not re-verified`);
+  registry.crashAt('land-after-tests');
+  if (git('rev-parse HEAD') !== T) die(`${target} moved from ${T.slice(0, 7)} while landing; land again`, 5);
+  const ff = trySh(`git -C ${q(root)} merge --ff-only ${M}`);
+  if (!ff.ok) die(`fast-forward of ${target} refused, nothing changed; commit or move the main checkout's changes to these files, then land again:\n${ff.out}`, 6);
+  registry.crashAt('land-after-ff');
+  fs.appendFileSync(ledger, `Landed: ${b} ${head.slice(0, 7)} as ${M.slice(0, 7)} on ${target}; re-ran ${tests.length} proved test file(s) on the merged tree${skipped}\n`);
+  console.log(`landed ${b} as ${M.slice(0, 7)} on ${target}${skipped}`);
+  // bin/h-queue land reads this line into the landing receipt's tests.
+  console.log('landed-tests: ' + JSON.stringify(tests));
+  registry.crashAt('land-after-ledger');
+  const kept = removeWorktree(id); if (kept) { console.log('landed; ' + kept); process.exit(0); }
+  const del = trySh(`git -C ${q(root)} branch -d ${q(b)}`); if (!del.ok) console.log('landed; branch kept: ' + del.out);
+  process.exit(0);
+}
+
+if (cmd === 'drop') {
+  beat(); needId(); const ledger = flag('--ledger'), reason = flag('--reason'), savePatch = args.includes('--save-patch');
+  if (!ledger || !fs.existsSync(ledger) || !reason) die('drop needs --ledger <file> --reason <text>', 2);
+  const b = branchOf(id), d = dirOf(id), stem = path.resolve(ledger).replace(/\.md$/, '');
+  let n = 1; while (fs.existsSync(`${stem}-dropped-r${n}.md`)) n++;
+  // A drop killed after its ledger line (after the forced worktree removal, or after `branch -D`)
+  // left that line in a ledger not yet moved: the next drop finishes it from the line, with the
+  // head and the patch it names, instead of dying `no branch` or dropping again without the patch.
+  const prev = lastDropped(ledger, b), hasBranch = exists(`refs/heads/${b}`);
+  if (!hasBranch && !prev) die(`no branch ${b}`);
+  const head = hasBranch ? git(`rev-parse ${q(b)}`) : prev.head;
+  const resumed = !!prev && prev.head === head && !registered().some(w => w.worktree === d);
+  // D05: a yield keeps uncommitted work as a patch beside the ledger. It is built through a temporary
+  // index (bin/h-test's --uncommitted pattern), so modifications, new files and deletions all go in
+  // and the worktree's own index is untouched; what setup made is left out, since setup makes it
+  // again in the next worktree and a patch adding it would no longer apply there.
+  let patchFile = resumed && prev.patch && fs.existsSync(prev.patch) ? prev.patch : null;
+  if (!resumed && savePatch && registered().some(w => w.worktree === d) && dirty(d)) {
+    const idx = path.join(os.tmpdir(), `h-worktree-index-${process.pid}`), env = { ...process.env, GIT_INDEX_FILE: idx };
+    let patch;
+    try {
+      sh('git read-tree HEAD', { cwd: d, env });
+      sh('git add -A', { cwd: d, env });
+      const mine = setupPaths(d).map(p => p.replace(/\/$/, ''));
+      if (mine.length) sh(`git rm -r -q --cached --ignore-unmatch -- ${mine.map(q).join(' ')}`, { cwd: d, env });
+      const tree = sh('git write-tree', { cwd: d, env });
+      patch = cp.execSync(`git diff --binary HEAD ${tree}`, { cwd: d, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 });
+    } catch (e) { die(`could not build the patch of uncommitted work in ${d}; nothing dropped:\n${((e.stderr || '') + (e.message || '')).trim()}`); }
+    finally { try { fs.unlinkSync(idx); } catch (e) {} }
+    patchFile = `${stem}-dropped-r${n}.patch`;
+    try { fs.writeFileSync(patchFile, patch); } catch (e) { die(`could not write the patch of uncommitted work to ${patchFile}; nothing dropped: ${e.message}`); }
+    const S = scratch('drop', head);
+    const ok = trySh(`git -C ${q(S)} apply --check ${q(patchFile)}`);
+    if (!ok.ok) { try { fs.unlinkSync(patchFile); } catch (e) {} die(`the patch of uncommitted work does not apply at ${head.slice(0, 7)}; nothing dropped:\n${ok.out}`); }
+  }
+  // Without a patch a dirty worktree is refused here, before the ledger says anything was dropped.
+  if (!patchFile) { const kept = removeWorktree(id); if (kept) die(kept); }
+  if (!resumed) fs.appendFileSync(ledger, `Dropped: ${b} at ${head} — ${reason}; recover with: git branch ${b} ${head}${patchFile ? `; uncommitted work saved in ${path.basename(patchFile)}, apply with: git apply ${patchFile}` : ''}\n`);
+  // The only forced removal of a package worktree: its head is in the ledger and its work in a checked patch.
+  if (patchFile && !resumed) { clearSetup(d); git(`worktree remove --force ${q(d)}`); }
+  registry.crashAt('drop-after-remove');
+  if (hasBranch) git(`branch -D ${q(b)}`);
+  registry.crashAt('drop-after-branch');
+  // After the branch delete: a crash before it leaves the ledger, and its `Dropped:` line, where the next drop reads it.
+  fs.renameSync(ledger, `${stem}-dropped-r${n}.md`);
+  // bin/h-queue yield reads the path after `uncommitted work saved in ` into the parked record.
+  console.log(`dropped ${b} at ${head.slice(0, 7)}; ledger moved to ${path.basename(stem)}-dropped-r${n}.md; the plan re-runs from a fresh ledger${patchFile ? `; uncommitted work saved in ${patchFile}` : ''}`);
+  // bin/h-queue yield reads the full head here: after a resumed drop there is no branch to read it from.
+  console.log('dropped-head: ' + head);
+  process.exit(0);
+}
+
+if (cmd === 'remove') {
+  beat(); needId(); const kept = removeWorktree(id); if (kept) die(kept);
+  const b = branchOf(id);
+  if (exists(`refs/heads/${b}`)) { const r = trySh(`git -C ${q(root)} branch -d ${q(b)}`); if (!r.ok) die(`${b} is not merged, kept; drop it to discard:\n${r.out}`); }
+  console.log(`removed ${id}`); process.exit(0);
+}
+
+// what exists in holden's namespace, for list, sweep and check
+function inventory() {
+  const regs = registered();
+  const trees = regs.filter(w => w.worktree && w.worktree.startsWith(BASE + path.sep));
+  const known = new Set(trees.map(w => w.worktree));
+  const orphans = fs.existsSync(BASE) ? fs.readdirSync(BASE).map(f => path.join(BASE, f)).filter(f => !known.has(f)) : [];
+  return { branches: holdenBranches(), trees, orphans, proofs: wt.deadProofs(root) };
+}
+// state.yaml writes `number: 1` where plan ids and directories write 001.
+const normPhase = x => String(x).replace(/^0+(?=\d)/, '');
+const phaseOf = name => { const m = name.match(/(?:^|\/|_)([\w.]+)-\d+$/); return m ? normPhase(m[1]) : undefined; };
+
+// The registry's view (phase 001 D01): a quick's or fix's worktree is protected while its package
+// is in flight. Lockless, as hooks/holden-statusline.js reads it; an unreadable registry is no
+// packages, and sweep and check fall back to the state.yaml rule alone.
+const records = () => { try { return Object.values(registry.readRegistry(root).packages || {}); } catch (e) { return []; } };
+const live = () => new Set(registry.inFlight({ packages: Object.fromEntries(records().map(p => [p.id, p])) }).map(p => p.id));
+
+if (cmd === 'check') {
+  if (!id) die('check needs a phase number', 2);
+  const inv = inventory();
+  const left = [...inv.branches.filter(b => phaseOf(b) === normPhase(id)), ...inv.trees.map(w => w.worktree).filter(d => phaseOf(path.basename(d)) === normPhase(id))];
+  // D04: a phase's package that is waiting or parked has not finished, branch or no branch.
+  for (const p of records()) if (p.state !== 'landed' && /^phase:/.test(p.owner || '') && normPhase(p.owner.slice(6)) === normPhase(id)) left.push(`package ${p.id} ${p.state}`);
+  if (left.length) { console.log(`phase ${id} still has:\n` + left.join('\n')); process.exit(1); }
+  console.log(`phase ${id}: no holden branches or worktrees left`); process.exit(0);
+}
+
+if (cmd === 'list') {
+  const inv = inventory();
+  console.log('branches: ' + (inv.branches.join(', ') || 'none'));
+  for (const w of inv.trees) console.log(`worktree: ${w.worktree} ${w.branch ? w.branch.replace('refs/heads/', '') : 'detached'}${dirty(w.worktree) ? ' (uncommitted work)' : ''}`);
+  for (const o of inv.orphans) console.log('unregistered dir: ' + o);
+  for (const p of inv.proofs) console.log('dead proof worktree: ' + p);
+  process.exit(0);
+}
+
+if (cmd === 'sweep') {
+  // Leftovers of phases that are not executing and of no package the registry lists in flight.
+  // Merged branches and clean worktrees go; anything unmerged or dirty is listed and left for the operator.
+  const statePath = path.join(root, '.planning', 'state.yaml');
+  const executing = new Set();
+  if (fs.existsSync(statePath)) for (const p of (yaml.load(statePath).phases || [])) if (p.status === 'executing') executing.add(normPhase(p.number));
+  const inv = inventory(), main = mainBranch(), act = [], left = [], lv = live();
+  for (const w of inv.trees) {
+    const name = path.basename(w.worktree);
+    const own = name.match(/^_(?:land|preflight|drop)-(\d+)$/);
+    if (own) { if (!wt.alive(Number(own[1]))) act.push([`remove throwaway ${w.worktree}`, `worktree remove --force ${q(w.worktree)}`]); continue; }
+    if (lv.has(name) || executing.has(phaseOf(name))) continue;
+    if (dirty(w.worktree)) left.push(`${w.worktree}: uncommitted work`); else act.push([`remove worktree ${w.worktree}`, `worktree remove ${q(w.worktree)}`]);
+  }
+  for (const b of inv.branches) {
+    if (lv.has(b.replace(/^holden\//, '')) || executing.has(phaseOf(b))) continue;
+    if (trySh(`git -C ${q(root)} merge-base --is-ancestor ${q(b)} ${q(main)}`).ok) act.push([`delete merged branch ${b}`, `branch -d ${q(b)}`]);
+    else left.push(`${b}: not merged into ${main}; land it, or drop it with h-worktree drop`);
+  }
+  for (const o of inv.orphans) left.push(`${o}: a directory git does not know as a worktree; look, then remove by hand`);
+  for (const p of inv.proofs) act.push([`remove dead proof worktree ${p}`, `worktree remove --force ${q(p)}`]);
+  for (const [what, c] of act) { console.log((dry ? '[dry] ' : '') + what); if (!dry) { const r = trySh(`git -C ${q(root)} ${c}`); if (!r.ok) left.push(`${what}: ${r.out}`); } }
+  if (!dry) trySh(`git -C ${q(root)} worktree prune`);
+  for (const l of left) console.log('left: ' + l);
+  if (!act.length && !left.length) console.log('sweep: nothing to do');
+  process.exit(left.length ? 1 : 0);
+}
+
+die('unknown command ' + cmd, 2);

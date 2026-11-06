@@ -1,0 +1,70 @@
+#!/usr/bin/env node
+'use strict';
+// codex-limits: the Codex plan's live usage, read from `codex app-server` (account/rateLimits/read).
+// Costs no model tokens; takes about a second.
+//   codex-limits          one line:  codex plus │ 5h 2%, resets in 4h 58m │ wk 0%, resets in 6d 23h │ 2 reset credits (first expires 2026-10-17)
+//   codex-limits --json   the raw result
+//   codex-limits --check  the one line prefixed by a verdict word, and an exit code a skill can branch on:
+//     0 ok          usable now
+//     3 exhausted   a window is spent (limit reached, or 5h/wk at 100%); the line says when it resets
+//     4 no-plan     the account may not use Codex (ordinary usage not allowed, or no paid plan): lapsed
+//                   subscription is the likely cause. INFERRED from the fields, not yet seen on a real lapse.
+//     1 unreadable  codex missing, not logged in, or the app server did not answer
+// Exit 1 with a message on stderr when codex is missing or does not answer within 15 s.
+const { spawn } = require('child_process');
+const json = process.argv.includes('--json'), check = process.argv.includes('--check');
+
+function until(epoch) {
+  const s = Math.round(epoch - Date.now() / 1000); if (!(s > 0)) return 'now';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), d = Math.floor(h / 24);
+  return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m}m` : `${m}m`;
+}
+function win(label, w) {
+  if (!w || w.usedPercent == null) return null;
+  return `${label} ${Math.round(w.usedPercent)}%${w.resetsAt ? `, resets in ${until(w.resetsAt)}` : ''}`;
+}
+function line(r) {
+  const rl = r.rateLimits || {};
+  const cells = [`codex${rl.planType ? ' ' + rl.planType : ''}`, win('5h', rl.primary), win('wk', rl.secondary)];
+  if (rl.rateLimitReachedType) cells.push(`LIMIT REACHED (${rl.rateLimitReachedType})`);
+  const credits = ((r.rateLimitResetCredits || {}).credits || []).filter(c => c.status === 'available');
+  if (credits.length) {
+    const first = Math.min(...credits.map(c => c.expiresAt || Infinity));
+    cells.push(`${credits.length} reset credit${credits.length > 1 ? 's' : ''}${isFinite(first) ? ` (first expires ${new Date(first * 1000).toISOString().slice(0, 10)})` : ''}`);
+  }
+  return cells.filter(Boolean).join(' │ ');
+}
+function verdict(r) {
+  const rl = r.rateLimits || {};
+  if (r.ordinaryUsageAllowed === false || !rl.planType || rl.planType === 'free') return ['no-plan', 4];
+  const spent = w => w && w.usedPercent != null && w.usedPercent >= 100;
+  if (rl.rateLimitReachedType || rl.spendControlReached || spent(rl.primary) || spent(rl.secondary)) return ['exhausted', 3];
+  return ['ok', 0];
+}
+
+let p;
+try { p = spawn('codex', ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'] }); }
+catch (e) { console.error('codex-limits: cannot start codex'); process.exit(1); }
+const fail = msg => { if (check) console.log(`unreadable: ${msg}`); console.error(`codex-limits: ${msg}`); try { p.kill(); } catch (e) {} process.exit(1); };
+p.on('error', () => fail('codex CLI not on PATH'));
+const timer = setTimeout(() => fail('no answer from codex app-server within 15 s'), 15000);
+const send = o => p.stdin.write(JSON.stringify(o) + '\n');
+let buf = '';
+p.stdout.setEncoding('utf8');
+p.stdout.on('data', chunk => {
+  buf += chunk; let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const raw = buf.slice(0, i); buf = buf.slice(i + 1);
+    let m; try { m = JSON.parse(raw); } catch (e) { continue; }
+    if (m.id !== 2) continue;
+    clearTimeout(timer); p.kill();
+    if (m.error) fail(`app-server error: ${m.error.message || JSON.stringify(m.error)}`);
+    if (json) { process.stdout.write(JSON.stringify(m.result, null, 2) + '\n'); process.exit(0); }
+    if (!check) { process.stdout.write(line(m.result) + '\n'); process.exit(0); }
+    const [word, code] = verdict(m.result);
+    process.stdout.write(`${word}: ${line(m.result)}\n`); process.exit(code);
+  }
+});
+send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'holden-codex-limits', version: '1' } } });
+send({ jsonrpc: '2.0', method: 'initialized', params: {} });
+send({ jsonrpc: '2.0', id: 2, method: 'account/rateLimits/read', params: {} });

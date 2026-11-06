@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+'use strict';
+// h-milestone-close: archive the current milestone's phase directories with pointer rewrite,
+// inside one metadata transaction (phase 002 D05). Run it with the token printed by
+// `h-queue meta open .planning/state.yaml .planning/asks.yaml .planning/ledger.md CLAUDE.md`.
+// It rewrites the pointers in the token's work copies, copies each landed phase dir from HEAD
+// under the token's new/ at <archive>/<milestone>/<dir name>, and lists the old dir in the
+// token's `remove` file; `h-queue meta commit <token>` publishes all of it as one commit. It
+// writes nothing in the working tree. Every pointer the path map touches, in the token's copies,
+// must resolve before (simulated) and after, and a file of the four that the token does not hold
+// must name none; a failure exits 1 and leaves the token as it found it. Pointers HEAD gains after
+// the open, in any shared file, are `meta commit`'s check (bin/h-queue metaChecks).
+// Flags: --token <token> (required unless --dry-run); --dry-run (print the map and the check, write nothing).
+const fs = require('fs'), path = require('path'), cp = require('child_process');
+const yaml = require(path.join(__dirname, '..', 'lib', 'yaml-lite.js'));
+const M = require(path.join(__dirname, '..', 'lib', 'meta.js'));
+const argv = process.argv.slice(2), dry = argv.includes('--dry-run');
+const ti = argv.indexOf('--token'), token = ti < 0 ? null : (argv[ti + 1] || '');
+if (!dry && !token) { console.error('h-milestone-close writes through a metadata transaction: run `h-queue meta open .planning/state.yaml .planning/asks.yaml .planning/ledger.md CLAUDE.md`, then `h-milestone-close --token <token>`'); process.exit(2); }
+const root = cp.execSync('git rev-parse --show-toplevel', { encoding: 'utf8' }).trim(); process.chdir(root);
+const T = token === null ? null : M.tokenDir(root, token);
+if (token !== null && (!T || !fs.existsSync(path.join(T, 'token.json')))) { console.error(`no such token: ${token}`); process.exit(1); }
+// The copy this script reads and writes: the token's work copy, or with --dry-run alone the tree's file.
+const src = f => T ? path.join(T, 'work', f) : f;
+const cfg = fs.existsSync('.holden/config.yaml') ? yaml.load('.holden/config.yaml') : yaml.load(path.join(__dirname, '..', 'templates', 'config.yaml'));
+const P = Object.assign({ phases: '.planning/phases', archive: '.planning/archive' }, cfg.paths || {});
+const statePath = '.planning/state.yaml';
+if (!fs.existsSync(src(statePath))) { console.error(T ? `the token holds no ${statePath}: open it with the other files` : `no ${statePath}`); process.exit(1); }
+const st = yaml.load(src(statePath));
+if (!st.milestone || !st.milestone.name) { console.error('no open milestone in state.yaml'); process.exit(1); }
+const ms = st.milestone.name;
+const phases = (st.phases || []).filter(p => String(p.milestone) === String(ms));
+const notLanded = phases.filter(p => p.status !== 'landed');
+if (notLanded.length) { console.error('not landed: ' + notLanded.map(p => p.number).join(', ')); process.exit(1); }
+if (!phases.length) { console.error('milestone has no phases'); process.exit(1); }
+const map = phases.map(p => { const from = p.dir || path.join(P.phases, `${String(p.number).padStart(3, '0')}-${p.slug}`); const to = path.join(P.archive, ms, path.basename(from)); if (!fs.existsSync(from)) { console.error('missing phase dir ' + from); process.exit(1); } return { from: from.replace(/\/$/, ''), to }; });
+const files = ['.planning/asks.yaml', '.planning/ledger.md', statePath, 'CLAUDE.md'].filter(f => fs.existsSync(src(f)));
+const pointerRe = /(?:^|[\s(`"'])((?:\.planning|docs|scripts|CLAUDE\.md)[A-Za-z0-9_./-]*)/g;
+function rewrite(text) { let out = text; for (const m of map) out = out.split(m.from).join(m.to); return out; }
+function pointersIn(text) { const seen = new Set(); let x; while ((x = pointerRe.exec(text))) seen.add(x[1].replace(/[.,;:)]+$/, '')); return [...seen]; }
+// Only pointers the path map touches are this script's business: a stale path elsewhere in these
+// files (a frozen GSD-era goal string, a hyphenated word like docs-only) must not block a close.
+const touched = q => map.some(m => [m.from, m.to].some(d => q === d || q.startsWith(d + '/')));
+// The token's copies are all the script rewrites: a file of the four it lacks would keep a pointer to a dir the commit removes.
+if (T) {
+  let held = null; try { held = JSON.parse(fs.readFileSync(path.join(T, 'token.json'), 'utf8')).files; } catch (e) {}
+  if (!Array.isArray(held)) { console.error(`token ${token} is unreadable: h-queue meta abort ${token}, then open again`); process.exit(1); }
+  for (const f of ['.planning/asks.yaml', '.planning/ledger.md', statePath, 'CLAUDE.md']) {
+    if (held.includes(f) || !fs.existsSync(f)) continue;
+    const hit = pointersIn(fs.readFileSync(f, 'utf8')).find(q => touched(q.split('#')[0]));
+    if (hit) { console.error(`the token does not hold ${f}, which names ${hit}: open it with the other files`); process.exit(1); }
+  }
+}
+function unresolved(text, exists) { return pointersIn(text).filter(p => { const base = p.split('#')[0]; return base && touched(base) && !exists(base); }); }
+// pre-check: simulate the move
+const existsAfter = q => { for (const m of map) if (q === m.to || q.startsWith(m.to + '/')) return fs.existsSync(m.from + q.slice(m.to.length)); return fs.existsSync(q); };
+const before = {}; let bad = [];
+for (const f of files) { const t = fs.readFileSync(src(f), 'utf8'); before[f] = t; const rw = rewrite(t); for (const u of unresolved(rw, existsAfter)) bad.push(`${f}: ${u}`); }
+console.log('path map:'); for (const m of map) console.log(`  ${m.from} -> ${m.to}`);
+if (bad.length) { console.error('pre-check failed, nothing moved. unresolved after rewrite:\n  ' + bad.join('\n  ')); process.exit(1); }
+if (dry) { console.log('dry run: pre-check passed'); process.exit(0); }
+// Into the token: HEAD's files of each phase dir under new/, the old dirs in `remove`, the rewritten copies.
+const removeFile = path.join(T, 'remove'), hadRemove = fs.existsSync(removeFile) ? fs.readFileSync(removeFile, 'utf8') : null;
+const made = [], newDir = path.join(T, 'new');
+// The dirs above each copy that this run creates: the undo removes them too, so the token is as it was.
+const fresh = [...new Set(map.flatMap(m => { const out = []; for (let d = path.dirname(path.join(newDir, m.to)); d.startsWith(newDir + path.sep); d = path.dirname(d)) out.push(d); return out; }))].filter(d => !fs.existsSync(d)).sort((a, b) => b.length - a.length);
+const git = a => cp.execFileSync('git', a, { maxBuffer: 1 << 28 });
+try {
+  for (const m of map) {
+    const recs = git(['ls-tree', '-r', '-z', '--full-tree', 'HEAD', '--', m.from]).toString('utf8').split('\0').filter(Boolean);
+    if (!recs.length) throw new Error(`${m.from} has no files at HEAD`);
+    const dest = path.join(T, 'new', m.to); made.push(dest);
+    for (const rec of recs) {
+      const [info, p] = rec.split('\t'), [mode, type, sha] = info.split(' ');
+      if (type !== 'blob' || (mode !== '100644' && mode !== '100755')) throw new Error(`${p} is not a regular file at HEAD`);
+      M.writeAtomic(path.join(dest, path.relative(m.from, p)), git(['cat-file', 'blob', sha]), mode === '100755' ? 0o755 : 0o644);
+    }
+  }
+  fs.writeFileSync(removeFile, (hadRemove || '') + map.map(m => m.from + '\n').join(''));
+  for (const f of files) fs.writeFileSync(src(f), rewrite(before[f]));
+  // state: mark archived (the dir lines were rewritten above)
+  let s = fs.readFileSync(src(statePath), 'utf8');
+  for (const p of phases) s = s.replace(new RegExp(`(- number: ${p.number}\\n(?:[ \\t]+[^\\n]*\\n)*?[ \\t]+status: )landed`), '$1archived');
+  fs.writeFileSync(src(statePath), s);
+  // The end state the commit publishes: a removed dir is gone, a copy under new/ is there.
+  const existsEnd = q => { for (const m of map) { if (q === m.from || q.startsWith(m.from + '/')) return false; if (q === m.to || q.startsWith(m.to + '/')) return fs.existsSync(path.join(T, 'new', q)); } return fs.existsSync(q); };
+  let bad2 = [];
+  for (const f of files) for (const u of unresolved(fs.readFileSync(src(f), 'utf8'), existsEnd)) bad2.push(`${f}: ${u}`);
+  if (bad2.length) throw new Error('post-check failed:\n  ' + bad2.join('\n  '));
+  console.log(`archived ${phases.length} phase dir(s) to ${path.join(P.archive, ms)} in token ${token}; pointers rewritten in ${files.join(', ')}; publish with h-queue meta commit ${token} -m "docs: close milestone ${ms}"`);
+} catch (e) {
+  for (const d of made) fs.rmSync(d, { recursive: true, force: true });
+  for (const d of fresh) try { fs.rmdirSync(d); } catch (x) {}
+  if (hadRemove === null) fs.rmSync(removeFile, { force: true }); else fs.writeFileSync(removeFile, hadRemove);
+  for (const f of files) fs.writeFileSync(src(f), before[f]);
+  console.error('undone. ' + e.message); process.exit(1);
+}

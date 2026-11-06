@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# codex-review — one bounded, read-only Codex pass over plans, a design, or a diff.
+#
+#   codex-review --kind plan   <phase> [opts]                 GSD-style phase plans (needs .planning/phases/<N>-*)
+#   codex-review --kind design --files f1 f2 --out-dir DIR    a design/decision record + plan
+#   codex-review --kind diff   --diff base..head --out-dir DIR  a code diff against its plan/decision
+#   codex-review --kind quick  --diff base..head --out-dir DIR --context GOAL.md [--reread]
+#                                                             a quick's diff against its goal file (skills/h-quick)
+#   codex-review --follow <report.md> --file Q.md [--dry-run]  continue a report's thread, on a thread Codex proposed
+#   opts: [--round 1|2] [--model gpt-6-sol] [--effort low|medium|high|xhigh|max|ultra] [--minutes 25]
+#         [--reads 60] [--files f1 f2 ...] [--context c1 c2 ...] [--out-dir DIR] [--dry-run]
+#
+# Files carry the kind: <phase>-PLAN-CODEX-REVIEW-r1.md, DIFF-CODEX-REVIEW-r1.md, DESIGN-CODEX-REVIEW-r1.md,
+# QUICK-CODEX-REVIEW-r1.md, so a plan review and a diff review of one phase sit apart in its directory.
+# Round 1 writes <out-dir>/<prefix>CODEX-REVIEW-r1.md. Round 2 runs only after <prefix>CODEX-RESPONSE-r1.md exists
+# beside it and re-checks the round-1 findings. Round 3+ is refused unless the operator agreed (h-review round-3 rule); this script never re-invokes
+# itself, so two agents cannot ping-pong. Override by hand: CODEX_REVIEW_MAX_ROUNDS=3.
+# A quick has one round: --round above 1 is refused, whatever the override. Its one re-read of fix hunks is
+# --reread, written to QUICK-REREAD-CODEX-REVIEW-r1.md beside QUICK-CODEX-REVIEW-r1.md, which must exist.
+# A published report is never overwritten: a second read of round 1 is --round 2. To redo a round, delete its report.
+# A review runs through codex-driver: a thread on a private app-server, which the operator can watch. Bounds:
+# read-only sandbox, a wall clock past which nothing is published, read budget stated in the prompt.
+# Codex may end a report with a thread it proposes to follow; a re-read may not. The caller decides, and a yes is
+# --follow, which reads <report>.session, resumes that thread and writes <report minus .md>-thread<K>.md beside the
+# report. A followed thread is not a response to findings, so it touches neither the report nor the round cap.
+# A follow's question goes out with the review's read budget and no-test rule after it. Two runs of one round: the
+# first to publish stands, the other exits 2 with its report dropped.
+# Prints the Codex plan's usage (bin/codex-limits) before and after the run, into the log too, and
+# exits 5 without running when the plan is spent, lapsed or unreadable (bin/codex-limits --check).
+set -euo pipefail
+usage() { sed -n 2,20p "$0"; exit "${1:-0}"; }
+[[ $# -ge 1 ]] || usage 1
+
+KIND=plan; PHASE=""; ROUND=1; MODEL="gpt-6-sol"; EFFORT="high"; MINUTES=25; READS=60; DRY=0; REREAD=0
+OUTDIR=""; DIFF=""; FILES=(); CTX=(); FOLLOW=""; QFILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --kind)    KIND="$2"; shift 2 ;;
+    --round)   ROUND="$2"; shift 2 ;;
+    --model)   MODEL="$2"; shift 2 ;;
+    --effort)  EFFORT="$2"; shift 2 ;;
+    --minutes) MINUTES="$2"; shift 2 ;;
+    --reads)   READS="$2"; shift 2 ;;
+    --out-dir) OUTDIR="$2"; shift 2 ;;
+    --diff)    DIFF="$2"; shift 2 ;;
+    --reread)  REREAD=1; shift ;;
+    --follow)  FOLLOW="$2"; shift 2 ;;
+    --file)    QFILE="$2"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    --files)   shift; while [[ $# -gt 0 && "$1" != --* ]]; do FILES+=("$1"); shift; done ;;
+    --context) shift; while [[ $# -gt 0 && "$1" != --* ]]; do CTX+=("$1"); shift; done ;;
+    -h|--help) usage 0 ;;
+    -*) echo "unknown flag: $1" >&2; usage 1 ;;
+    *)  [[ -z "$PHASE" ]] && PHASE="$1" || { echo "unexpected arg: $1" >&2; usage 1; }; shift ;;
+  esac
+done
+
+# A round that is not a positive integer would pass the cap as 0 and skip the overwrite check.
+[[ "$ROUND" =~ ^[1-9][0-9]*$ ]] || { echo "bad --round: $ROUND (1, 2, ...)" >&2; exit 1; }
+(( REREAD == 0 )) || [[ "$KIND" == quick ]] || { echo "--reread is for --kind quick" >&2; exit 1; }
+[[ -n "$FOLLOW" || -z "$QFILE" ]] || { echo "--file is for --follow" >&2; exit 1; }
+if [[ -n "$FOLLOW" ]]; then
+  [[ -n "$QFILE" ]] || { echo "--follow needs --file Q.md" >&2; exit 1; }
+  [[ -f "$QFILE" ]] && grep -q '[^[:space:]]' "$QFILE" || { echo "no question in $QFILE (missing or empty)" >&2; exit 1; }
+  [[ -f "$FOLLOW" ]] || { echo "no report $FOLLOW" >&2; exit 1; }
+  FOLLOW="$(readlink -f -- "$FOLLOW")"; QFILE="$(readlink -f -- "$QFILE")"
+fi
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"; cd "$REPO"
+command -v codex >/dev/null || { echo "codex CLI not on PATH (npm i -g @openai/codex)" >&2; exit 1; }
+HERE="$(dirname "$(readlink -f "$0")")"; LIMITS="${CODEX_REVIEW_LIMITS:-$HERE/codex-limits}"; THREAD=""; PROPOSE=1
+limits() { echo "[$(date -Is)] codex limits $1: $("$LIMITS" 2>&1 || true)" | tee -a "$LOG"; }
+# One round through the driver. Its answer goes to a temp file beside $OUT, renamed onto $OUT only after the driver
+# exited 0, so a failed or empty run never publishes, and never leaves a stale earlier report looking fresh. This
+# script's exit code is the gate; a leftover $OUT from an earlier round is reported but not trusted.
+run_round() {
+  local base; base="$(dirname "$OUT")/.$(basename "$OUT")"
+  TMP="$base.tmp.$$"; PROMPTF="$base.prompt.$$"; IDF="$base.id.$$"
+  local label="$KIND-r$ROUND"; [[ -z "$FOLLOW" ]] || label="follow-$K"
+  DRIVER=("$HERE/codex-driver" --cwd "$ROOTDIR" --model "$MODEL" --effort "$EFFORT" --minutes "$MINUTES" --prompt "$PROMPTF" --out "$TMP" --id-file "$IDF" --label "$label")
+  [[ -z "$THREAD" ]] || DRIVER+=(--thread "$THREAD")
+  if (( DRY )); then echo "### would run, in $ROOTDIR:"; "${DRIVER[@]}" --dry-run; echo "### report: $OUT"; echo "### prompt:"; echo "$PROMPT"; exit 0; fi
+  # The plan's usage before and after, so every run says what it cost. Never fatal: a failed read is a line, not a gate.
+  echo "[$(date -Is)] kind=$KIND round=$ROUND model=$MODEL effort=$EFFORT minutes=$MINUTES -> $OUT" | tee -a "$LOG"
+  # Gate: a spent window, a lapsed plan or an unreadable account refuses before any wall clock is spent.
+  # Exit 5 means "Codex unavailable, ask the operator" (h-review): fall back to self, wait for the reset,
+  # or renew the plan. CODEX_REVIEW_SKIP_LIMITS=1 skips the gate by hand; CODEX_REVIEW_LIMITS names another limits command.
+  if [[ "${CODEX_REVIEW_SKIP_LIMITS:-0}" != 1 ]]; then
+    set +e; verdict="$("$LIMITS" --check 2>/dev/null)"; vrc=$?; set -e
+    echo "[$(date -Is)] codex limits before: ${verdict:-unreadable: no output}" | tee -a "$LOG"
+    if (( vrc != 0 )); then
+      echo "codex unavailable (${verdict%%:*}), no review run; see $LOG" >&2
+      exit 5
+    fi
+  else
+    limits before
+  fi
+  rm -f "$TMP" "$IDF"; trap 'rm -f "$TMP" "$PROMPTF" "$IDF"' EXIT
+  printf '%s' "$PROMPT" > "$PROMPTF"
+  # The death signal stops the driver, and with it the server, when this script is killed: bash runs no trap for that.
+  set +e; setpriv --pdeathsig TERM "${DRIVER[@]}"; rc=$?; set -e
+  echo "[$(date -Is)] exit=$rc" | tee -a "$LOG"
+  limits after
+  if (( rc != 0 )); then
+    echo "codex failed (exit $rc), no report published; see $LOG" >&2
+    [[ -f "$OUT" ]] && echo "note: $OUT is from an earlier run, not this one" >&2
+    exit "$rc"
+  fi
+  if [[ ! -s "$TMP" ]]; then
+    echo "codex exited 0 but wrote no report, none published; see $LOG" >&2
+    [[ -f "$OUT" ]] && echo "note: $OUT is from an earlier run, not this one" >&2
+    exit 1
+  fi
+  if [[ -n "$FOLLOW" ]]; then
+    # Another follow may have published this K during the run: a link never overwrites, so take the next.
+    until ln -- "$TMP" "$OUT" 2>/dev/null; do
+      [[ -e "$OUT" ]] || { echo "cannot publish $OUT" >&2; exit 1; }
+      K=$((K + 1)); OUT="${FOLLOW%.md}-thread$K.md"
+    done
+    rm -f "$TMP"
+  else
+    # Another run of this round may have published during this one: a link never overwrites, so this run loses.
+    ln -- "$TMP" "$OUT" 2>/dev/null || {
+      [[ -e "$OUT" ]] || { echo "cannot publish $OUT" >&2; exit 1; }
+      echo "refusing: $OUT was published during this run; this run's report is dropped" >&2; exit 2
+    }
+    rm -f "$TMP"
+  fi
+}
+if [[ -n "$FOLLOW" ]]; then
+  SESSION="${FOLLOW%.md}.session"
+  [[ -f "$SESSION" ]] || { echo "no thread to follow: $SESSION is missing (a re-read proposes none; a report from before threads has none)" >&2; exit 1; }
+  field() { awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$SESSION"; }
+  THREAD="$(field id)"; MODEL="$(field model)"; EFFORT="$(field effort)"; MINUTES="$(field minutes)"; ROOTDIR="$(field root)"
+  [[ "$THREAD" =~ ^[0-9A-Fa-f][0-9A-Fa-f-]{7,}$ ]] || { echo "unreadable session file $SESSION: id '$THREAD'" >&2; exit 1; }
+  [[ "$ROOTDIR" == /* && -d "$ROOTDIR" ]] || { echo "unreadable session file $SESSION: root '$ROOTDIR' is not a directory" >&2; exit 1; }
+  K=1; while [[ -e "${FOLLOW%.md}-thread$K.md" ]]; do K=$((K + 1)); done
+  OUT="${FOLLOW%.md}-thread$K.md"; LOG="${FOLLOW%-r[0-9]*.md}.log"; KIND=follow
+  # A review's bounds hold on every turn of its thread (D10), not only on its first.
+  PROMPT="$(cat "$QFILE")"$'\n\n'"Budget: about ${READS} file reads and ${MINUTES} minutes of wall clock; the process is killed at the limit, so write your answer before you run out. Do not run test suites."
+  run_round
+  echo "report: $OUT"
+  exit 0
+fi
+MAX_ROUNDS="${CODEX_REVIEW_MAX_ROUNDS:-2}"
+(( ROUND <= MAX_ROUNDS )) || { echo "refusing round $ROUND: cap is $MAX_ROUNDS (CODEX_REVIEW_MAX_ROUNDS overrides by hand)" >&2; exit 2; }
+
+case "$KIND" in
+  plan)
+    [[ -n "$PHASE" ]] || { echo "--kind plan needs a phase number" >&2; usage 1; }
+    PHASE_DIR="$(ls -d .planning/phases/"${PHASE}"-*/ 2>/dev/null | head -1 || true)"
+    # h-grill pads phase numbers to three digits; "7" finds 007-*. A decimal phase (999.1) is taken as given.
+    if [[ -z "$PHASE_DIR" && "$PHASE" =~ ^[0-9]+$ ]]; then
+      printf -v PADDED '%03d' "$((10#$PHASE))"
+      PHASE_DIR="$(ls -d .planning/phases/"${PADDED}"-*/ 2>/dev/null | head -1 || true)"
+      [[ -n "$PHASE_DIR" ]] && PHASE="$PADDED"
+    fi
+    [[ -n "$PHASE_DIR" ]] || { echo "no phase dir matches .planning/phases/${PHASE}-*/" >&2; exit 1; }
+    OUTDIR="${OUTDIR:-${PHASE_DIR%/}}"; PREFIX="${PHASE}-PLAN-"
+    if (( ${#FILES[@]} == 0 )); then
+      mapfile -t FILES < <(ls "${PHASE_DIR%/}"/"${PHASE}"-*-PLAN.md 2>/dev/null || true)
+      (( ${#FILES[@]} > 0 )) || { echo "no ${PHASE}-NN-PLAN.md in $PHASE_DIR" >&2; exit 1; }
+    fi
+    for n in CONTEXT DECISION RESEARCH PATTERNS VALIDATION; do p="${PHASE_DIR%/}/${PHASE}-${n}.md"; [[ -f "$p" ]] && CTX+=("$p"); done
+    ;;
+  design)
+    (( ${#FILES[@]} > 0 )) || { echo "--kind design needs --files" >&2; exit 1; }
+    [[ -n "$OUTDIR" ]] || { echo "--kind design needs --out-dir" >&2; exit 1; }; PREFIX="DESIGN-"
+    ;;
+  diff)
+    [[ -n "$DIFF" ]] || { echo "--kind diff needs --diff base..head" >&2; exit 1; }
+    [[ -n "$OUTDIR" ]] || { echo "--kind diff needs --out-dir" >&2; exit 1; }; PREFIX="DIFF-"
+    # A bare ref would have Codex run `git diff <ref>` (the working tree included) and `git log <ref>` (all history).
+    [[ "$DIFF" == ?*..?* && "$DIFF" != *...* ]] || { echo "--diff needs base..head (two dots, both ends): $DIFF" >&2; exit 1; }
+    git rev-parse "${DIFF%%..*}" "${DIFF##*..}" >/dev/null || { echo "bad diff range $DIFF" >&2; exit 1; }
+    ;;
+  quick)
+    [[ -n "$DIFF" ]] || { echo "--kind quick needs --diff base..head" >&2; exit 1; }
+    [[ -n "$OUTDIR" ]] || { echo "--kind quick needs --out-dir" >&2; exit 1; }
+    (( ${#CTX[@]} > 0 )) || { echo "--kind quick needs --context <goal file>: the goal, its entry point, its red test and why it is safe" >&2; exit 1; }
+    (( ${#FILES[@]} == 0 )) || { echo "--kind quick takes no --files: a quick has no plan; its goal goes in --context" >&2; exit 1; }
+    (( ROUND == 1 )) || { echo "refusing round $ROUND: a quick has one round; its one re-read of fix hunks is --reread" >&2; exit 2; }
+    [[ "$DIFF" == ?*..?* && "$DIFF" != *...* ]] || { echo "--diff needs base..head (two dots, both ends): $DIFF" >&2; exit 1; }
+    git rev-parse "${DIFF%%..*}" "${DIFF##*..}" >/dev/null || { echo "bad diff range $DIFF" >&2; exit 1; }
+    PREFIX="QUICK-"; FIRST="$OUTDIR/QUICK-CODEX-REVIEW-r1.md"
+    if (( REREAD )); then
+      [[ -f "$FIRST" ]] || { echo "--reread needs the first review $FIRST" >&2; exit 1; }
+      PREFIX="QUICK-REREAD-"
+    fi
+    ;;
+  *) echo "unknown --kind $KIND" >&2; usage 1 ;;
+esac
+mkdir -p "$OUTDIR"
+for f in "${FILES[@]}" "${CTX[@]}"; do [[ -f "$f" ]] || { echo "missing file: $f" >&2; exit 1; }; done
+OUT="$OUTDIR/${PREFIX}CODEX-REVIEW-r${ROUND}.md"; LOG="$OUTDIR/${PREFIX}CODEX-REVIEW.log"
+PREV_REVIEW="$OUTDIR/${PREFIX}CODEX-REVIEW-r$((ROUND-1)).md"; PREV_RESPONSE="$OUTDIR/${PREFIX}CODEX-RESPONSE-r$((ROUND-1)).md"
+if (( ROUND >= 2 )); then
+  [[ -f "$PREV_REVIEW" ]]   || { echo "round $ROUND needs $PREV_REVIEW" >&2; exit 1; }
+  [[ -f "$PREV_RESPONSE" ]] || { echo "round $ROUND needs $PREV_RESPONSE: write what changed first" >&2; exit 1; }
+fi
+# A second read of the same subject is the next round, not a fresh run over a published report.
+if [[ -f "$OUT" ]]; then
+  if [[ "$KIND" == quick ]]; then
+    echo "refusing: $OUT exists; a quick gets one review and one re-read of fix hunks (--reread); a further read needs the operator" >&2
+  else
+    echo "refusing: $OUT exists; a second read is --round $((ROUND+1)) (write ${PREFIX}CODEX-RESPONSE-r${ROUND}.md first)" >&2
+    echo "to redo round $ROUND instead, delete that file by hand" >&2
+  fi
+  exit 2
+fi
+
+list() { for f in "$@"; do printf -- '- %s\n' "$f"; done; }
+# The diff kind's items 2, 4 and 5 are the quick kind's 1, 2 and 3, so the two kinds keep one wording.
+# The sixth item is the same text in both kinds.
+CORRECTNESS="CORRECTNESS: a bug you can demonstrate by reading the code: wrong branch, wrong default, lost error, off-by-one, race. For each guard the diff adds or changes (an ownership or token check, a status filter, an existence test), name every point between the check and the write it guards where another actor can run (an await, a second statement under READ COMMITTED, a released lock), and say whether the check still holds at the write; a guard that skips on an unknown owner is a finding. For each branch the diff deletes and each call it moves under a new timeout, lock or transaction, list the inputs or exceptions that reached the old place and where each lands now."
+TEST_HONESTY="TEST HONESTY: a test that would pass with the change reverted, or asserts nothing."
+BOUNDARY="BOUNDARY: a change that crosses a contract another consumer depends on without updating it. Every sentence the diff adds or keeps in a contract document, or in the docstring of a function it changes, is read against the code and the edge tests: a sentence promising more than the code does, a state named by a word the code does not use, or a list of routes, fields or methods the diff changed and the list did not follow is a finding."
+IDS="PLANNING IDS: a phase id, quick id or decision id added in a code comment, docstring or test name (a Phase or Quick word with a number, a number then a Dnn id, a Dnn id alone in parentheses or opening a comment). Run ~/.claude/holden/bin/h-radius --check-ids --range ${DIFF} and list each hit, then read the added comments for prose forms it misses (\"per the phase 12 decision\"). Allowed: ledger.md Lnnn ids and FLAG-NNN-NN reason strings. Exempt: docs, .claude/rules, .planning/, and node_modules/, dist/, build/, vendor/ at any depth. This is a stated rule, not taste."
+(( REREAD == 0 )) || PROPOSE=0
+HARNESS=" The harness that
+executes plans runs the full test suite and a diff review after the last plan lands, and a
+per-plan gate between plans; plans are not asked to do either, and omitting them is not a finding."
+# shellcheck disable=SC2034  # read in the R1 heredoc inside PROMPT, which shellcheck does not parse (as LOOKFOR)
+LOOKHEAD="## What to look for, in priority order"
+COVERAGE="Which decisions / criteria you traced, and which you did not find."
+LABEL="$KIND"
+case "$KIND" in
+  plan) INTRO="You are reviewing implementation PLANS for phase ${PHASE} of this repository. The plans will be executed verbatim by an agent that follows them literally, so a plan that is vague, contradicts the decisions, or misreads the code produces broken work. Find those defects before execution."
+        SUBJECT="## The files under review
+$(list "${FILES[@]}")"
+        LOOKFOR="1. GOAL FAILURE: tasks that, executed literally, would not make the phase's success criteria true.
+2. DECISION DRIFT: a task that contradicts or silently drops a numbered decision in the context/decision file, or a task that adds a user-visible behaviour (a stop, a cap, a refusal) no decision names.
+3. CODE MISREADS: a file:line, function, signature, column, enum or fixture the plan cites that does not exist or behaves differently. Check in the repo.
+4. MISSING GUARDS: a default-off dial that does not reproduce today's behaviour exactly, a hardcoded single-tenant number, a measurement without a decidable denominator, a test that cannot fail.
+5. UNDER-SPECIFIED TASKS: an action an executor could satisfy with a shrug. Say what target state is missing.
+6. TEST CLAIMS: for each Catches line, the wrong implementation it claims to catch, traced through the test as specified (setup, stubs, input) at the base commit. A test that stubs the function it claims to catch, a stub returning one value where two producers must differ, a setup that fails before the named assertion, or a guard whose input the parent refuses is a finding. Each Edge names a test or a Measured line; an Edge resting on a library's behaviour with no Measured line from the installed version is a finding." ;;
+  design) INTRO="You are reviewing a DESIGN: a decision record and the build plan that argues from it. The design will be built by an agent following the plan literally, and then used daily across many repositories. Find decisions that contradict each other, plan tasks that do not follow from a decision, and gaps a first week of use would expose."
+        SUBJECT="## The files under review
+$(list "${FILES[@]}")"
+        LOOKFOR="1. CONTRADICTION: two decisions that cannot both hold, or a plan task that violates a decision.
+2. UNGROUNDED TASK: a plan task no decision calls for, or a decision no task delivers.
+3. OPERATIONAL GAP: something the first week of real use needs that neither file provides (recovery after a failed step, a file two commands both write, a name collision, an assumption about the host tool that may be false). Check the repository for what exists.
+4. MISREAD OF THE HOST: a claim about how Claude Code loads skills, agents, hooks or settings that you can show is wrong or unverifiable.
+5. UNDER-SPECIFIED VERIFICATION: a task whose verify step could pass while the task is wrong." ;;
+  diff) INTRO="You are reviewing a CODE DIFF (${DIFF}) against the plan or decision record it implements. Find defects the author cannot see from inside the change."
+        SUBJECT="## The change under review
+Run: git diff ${DIFF} --stat ; git diff ${DIFF} ; git log --oneline ${DIFF}
+Plan / decision files it implements:
+$(list "${FILES[@]}")"
+        LOOKFOR="1. SPEC GAP: something the plan or decision required that the diff does not do, or does differently.
+2. ${CORRECTNESS}
+3. SCOPE CREEP: behaviour no decision in the decision record names, even where the plan asks for it; at least a WARNING.
+4. ${TEST_HONESTY}
+5. ${BOUNDARY}
+6. ${IDS}" ;;
+  quick) INTRO="You are reviewing the CODE DIFF (${DIFF}) of a quick: one goal, stated by a red test or by a claim that no useful test exists, and the smallest change that turns it green. The context file names the goal, the one entry point its behaviour shows from, the red test and why the change is safe. There is no plan and no decision record. Find defects the author cannot see from inside the change."
+         SUBJECT="## The change under review
+Run: git diff ${DIFF} --stat ; git diff ${DIFF} ; git log --oneline ${DIFF}"
+         HARNESS=""
+         COVERAGE="Which of the six items you checked, and the path from the entry point you traced."
+         LOOKFOR="1. ${CORRECTNESS}
+2. ${TEST_HONESTY}
+3. ${BOUNDARY}
+4. READERS: for each function, column, key, route, event payload or file whose shape the diff changes, list its readers (rg). A reader the diff neither changes nor the context file explains is a finding.
+5. ENTRY POINT: the goal's behaviour shows from the one entry point the context file names (a route, a screen or component, a worker cycle). Each of these is a finding: a changed code file that entry point does not reach, unless it is an adapter or storage that only carries the change; a second contract change, or one that is not additive; more than one migration (a forward file and its rollback are one); a change to another repository's code.
+6. ${IDS}
+A finding that carries neither a command with its output nor a path traced as path:line steps goes under \"Could not verify\", not under Findings."
+         if (( REREAD )); then
+           LABEL="quick re-read"
+           # shellcheck disable=SC2034  # read in the R1 heredoc, as above
+           LOOKHEAD="## This is the one re-read of fix hunks
+The first review, written to ${FIRST}, is quoted between the two marker lines below. Read it here; do not open that path, which may sit outside the repository you run in. The diff above holds only the fix commits that answer it. For each finding of the first review that a fix hunk addresses, say ADDRESSED or STILL OPEN with one line of evidence. Then check only the fix hunks against the items below; a defect they introduce is a finding. Open no other line of review.
+----- the first review -----
+$(cat "$FIRST")
+----- end of the first review -----
+### What to look for in the fix hunks, in priority order"
+         fi ;;
+esac
+PROMPT="$(cat <<PROMPT
+${INTRO} You are one reviewer among others; be precise, not exhaustive.${HARNESS}
+
+## Read these first
+$(list "${CTX[@]}")
+$( [[ -f CLAUDE.md ]] && echo "- CLAUDE.md (house rules)" )
+
+${SUBJECT}
+
+## You may explore
+You are in a READ-ONLY sandbox at the repository root. Use rg / sed -n / cat / git log / git diff freely.
+Budget: about ${READS} file reads and ${MINUTES} minutes of wall clock; the process is killed at the
+limit, so write your report before you run out. Do not run test suites. Do not ask questions; you
+will get no answer. If you cannot verify a claim, say "could not verify" and move on.
+
+$( if (( ROUND >= 2 )); then cat <<R2
+## This is round ${ROUND}: verify, do not re-review
+Your previous report: ${PREV_REVIEW}
+The author's response describing what changed: ${PREV_RESPONSE}
+For EACH finding of your previous report decide ADDRESSED, PARTIALLY ADDRESSED, or STILL OPEN with one
+line of evidence. ADDRESSED needs evidence that would read differently had the fix been wrong: a run the response records, or a path you traced; a fix resting on an untested premise, or marked unrun, is PARTIALLY ADDRESSED with the premise named. Open no new lines of review unless a change introduced a NEW BLOCKER; then add it
+under "New blockers" and nothing else.$( (( ROUND >= MAX_ROUNDS )) && echo " This is the last round.")
+R2
+else cat <<R1
+${LOOKHEAD}
+${LOOKFOR}
+Skip: style, naming taste, formatting, anything marked discretionary.
+R1
+fi )
+
+## Output: write exactly this, nothing else after it
+# Codex review (${LABEL}), round ${ROUND}, model ${MODEL}
+## Verdict
+One of: PASS (no BLOCKER) / REVISE (at least one BLOCKER), one sentence why.
+## Findings
+For each finding:
+### [BLOCKER|WARNING|INFO] <short title>
+- **Where:** <file> -> <section, task or decision id>
+- **Claim / defect:** one or two sentences.
+- **Evidence:** <file:line or quote>, what you actually saw.
+- **Reached by (BLOCKER):** the production entry point and the chain to the defect, path:line each (the caller, the shell that mounts the component), and who reaches it how often.
+- **Governing rule (BLOCKER):** the quoted decision, contract line, field definition or framework handler that decides the case, path:line.
+- **Fix:** the concrete change (target state, not "align with").
+BLOCKERs first. A BLOCKER fills both added lines; one you cannot fill is a WARNING that says which is missing, and a defect whose fix the decision's Out of scope excludes is a WARNING that says so. When the governing rule requires the behaviour, the finding is a question under "Could not verify". A race test you ask for names the inputs through the route that produce the race. A race that breaks an invariant the decision states is at least a WARNING, however short its window or old its cause; "heals on the next report" is not a ruling the decision made. A race whose end state the decision already accepts from an ordinary sequence is INFO, naming that sequence. Prefer the few findings that matter; a WARNING you are unsure of goes under "Could not verify".
+## Could not verify
+## Coverage
+${COVERAGE}
+$( (( PROPOSE )) && cat <<TF
+## Thread to follow
+Only if you saw a thread beyond this review that is worth following: say in your own words what it is and why. Do not follow it yet; the session reading this decides, and a yes comes back to you in this conversation. Leave this section out otherwise.
+TF
+)
+PROMPT
+)"
+ROOTDIR="$REPO"
+run_round
+# The thread a --follow resumes; a re-read proposes nothing, so it keeps no session.
+if (( PROPOSE )); then
+  printf 'id=%s\nmodel=%s\neffort=%s\nminutes=%s\nroot=%s\n' "$(cat "$IDF")" "$MODEL" "$EFFORT" "$MINUTES" "$ROOTDIR" > "${OUT%.md}.session"
+fi
+echo "report: $OUT"; grep -m1 -A1 '^## Verdict' "$OUT" || true

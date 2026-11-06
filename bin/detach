@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# detach <name> <command...>: launch a long run detached (survives the harness watchdog),
+# register it so the Stop hook refuses to let a finished-but-unread or unwatched run slip
+# (in the session that launched it, recorded as session= from CLAUDE_CODE_SESSION_ID).
+set -euo pipefail
+[ $# -ge 2 ] || { echo "usage: detach <name> <command...>" >&2; exit 2; }
+name=$1; shift; cmd=$*
+R=$HOME/.claude/detached; mkdir -p "$R"
+out=$R/$name.out
+if [ -e "$R/$name.run" ] && [ ! -e "$R/$name.seen" ]; then
+  echo "detach: '$name' is registered and not marked seen; read it and run detach-seen $name first" >&2; exit 3
+fi
+rm -f "$R/$name.seen" "$R/$name.waiter"
+# session= lets the Stop hook alert only the session that launched the run.
+printf 'out=%s\ncwd=%s\nstarted=%s\nsession=%s\ncmd=%s\n' "$out" "$PWD" "$(date '+%F %T %Z')" \
+  "${CLAUDE_CODE_SESSION_ID:-}" "$cmd" > "$R/$name.run"
+setsid nohup bash -c "$cmd; echo \"EXIT \$?\"" > "$out" 2>&1 < /dev/null &
+echo "detached '$name' pid $! -> $out"
+echo "NOW arm the waiter as a background Bash task: detach-wait $name [timeout_s]"

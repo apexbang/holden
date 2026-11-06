@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Generate .planning/state.yaml for a GSD repo (holden conversion step T8).
+
+Reads phase directories (live and archived), ROADMAP.md titles and milestone ranges, STATE.md
+for the current phase, and one pass of git history for dates. Writes flat YAML that
+lib/yaml-lite.js can read: scalars only, goals double-quoted with inner double quotes
+replaced.
+
+Usage: gsd-state [--repo DIR] [--out .planning/state.yaml] [--project NAME]
+                 [--milestone-goal TEXT] [--milestone-opened DATE] [--dry-run]
+Prints a report of what it could not derive so the operator can spot-check.
+"""
+import argparse, os, re, subprocess, sys
+from collections import defaultdict
+
+PHASE_DIR = re.compile(r'^(\d+(?:\.\d+)?[A-Za-z]?)-(.+)$')
+QUICK_DIR = re.compile(r'^([0-9A-Za-z]+)-(.+)$')
+MS_LINE = re.compile(r'^- .*?\*\*(v\d+\.\d+) ([^*]+?)\*\*(.*)$')
+MS_SUB = re.compile(r'^\s+- .*?\*\*Phase (\d+(?:\.\d+)?[A-Za-z]?)\s*[—–:-]\s*([^*]+)\*\*')
+SECTION_HDR = re.compile(r'^### (v\d+\.\d+) (?!Phase Details|Integration Points|Progress)\S')
+PROGRESS_HDR = re.compile(r'^### Progress\s*[—–-]+\s*(v\d+\.\d+)')
+PROGRESS_ROW = re.compile(r'^\| (\d+(?:\.\d+)?[A-Za-z]?)[. ]')
+RANGE_TOKEN = re.compile(r'\d+(?:\.\d+)?[A-Za-z]?(?:\s*[-–]\s*\d+(?:\.\d+)?)?')
+PHASE_HDR = re.compile(r'^#{3,4} (?:~~)?\**Phase (\d+(?:\.\d+)?[A-Za-z]?)(?:\s*\([^)]*\))?\s*[:.—–-]\s*(.+?)\**$')
+DEFER_WORDS = re.compile(r'OBSOLETE|SUPERSEDED|BACKLOG|DEFERRED|RETIRED|SCRAPPED', re.I)
+SHIPPED_WORDS = re.compile(r'SHIPPED|COMPLETE', re.I)
+CHECKBOX = re.compile(r'^- \[[ x]\] (?:~~)?(?:\*\*)?Phase (\d+(?:\.\d+)?[A-Za-z]?)[:.]\s*([^*(—–]+)')
+PROD_ID = re.compile(r'prod `?([a-z0-9]{8})`?')
+
+def run(cmd, cwd):
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True).stdout
+
+def norm_key(num):
+    # '01' and '1' are the same phase: directories are often zero-padded, roadmaps never are.
+    return re.sub(r'^0+(?=\d)', '', num).lower()
+
+def norm_num(num):
+    return re.sub(r'^0+(?=\d)', '', num)
+
+def parse_ranges(text):
+    """Window after 'Phases': '188-193' | '181-184, 186-187' | '283 / 283b / 284 + x' | '313–321' -> keys"""
+    keys = set()
+    windows = [re.split(r'[();]|\.\s|\b\d{4}-\d\d', w)[0] for w in re.findall(r'Phases?\s+(\d.*)', text)]
+    for part in [t for w in windows for t in RANGE_TOKEN.findall(w)]:
+        part = part.strip().replace('–', '-')
+        m = re.match(r'^(\d+)(?:\.(\d+))?\s*-\s*(\d+)(?:\.(\d+))?$', part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(3))
+            for n in range(a, b + 1):
+                keys.add(str(n))
+            if m.group(4):
+                keys.add(f'{b}.{m.group(4)}')
+            continue
+        m = re.match(r'^(\d+(?:\.\d+)?[A-Za-z]?)$', part)
+        if m:
+            keys.add(norm_key(m.group(1)))
+    return keys
+
+def clean_title(t):
+    t = re.sub(r'~~|\*\*', '', t)
+    t = re.sub(r'[✅🚧⏳❌🧾✓]', '', t)
+    t = t.strip(' —–-')
+    if len(t) > 110:
+        cut = min([i for i in (t.find(' — ', 60), t.find(' (', 60), t.find(' – ', 60), t.find(': ', 60)) if i > 0] or [len(t)])
+        t = t[:cut]
+    if len(t) > 140:
+        t = t[:137].rstrip() + '...'
+    return t.strip(' —–-.,;')
+
+def q(s):
+    return '"' + s.replace('"', "'") + '"'
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--repo', default='.')
+    ap.add_argument('--out', default='.planning/state.yaml')
+    ap.add_argument('--project', default=None)
+    ap.add_argument('--milestone-goal', default='')
+    ap.add_argument('--milestone-opened', default='')
+    ap.add_argument('--dry-run', action='store_true')
+    args = ap.parse_args()
+    repo = os.path.abspath(args.repo)
+    pl = os.path.join(repo, '.planning')
+    project = args.project or os.path.basename(repo)
+
+    # 1. Phase dirs: live and archived.
+    phases = {}  # key -> dict
+    live_dir = os.path.join(pl, 'phases')
+    for d in sorted(os.listdir(live_dir)):
+        m = PHASE_DIR.match(d)
+        if m and os.path.isdir(os.path.join(live_dir, d)):
+            phases[norm_key(m.group(1))] = dict(number=norm_num(m.group(1)), slug=m.group(2), dir=f'.planning/phases/{d}', archived=False, milestone=None)
+    ms_dir = os.path.join(pl, 'milestones')
+    if os.path.isdir(ms_dir):
+        for md in sorted(os.listdir(ms_dir)):
+            if not md.endswith('-phases'):
+                continue
+            ver = md[:-len('-phases')]
+            for d in sorted(os.listdir(os.path.join(ms_dir, md))):
+                m = PHASE_DIR.match(d)
+                if m and os.path.isdir(os.path.join(ms_dir, md, d)):
+                    k = norm_key(m.group(1))
+                    if k in phases:
+                        print(f'WARN duplicate phase {k}: {phases[k]["dir"]} and milestones/{md}/{d}', file=sys.stderr)
+                    phases[k] = dict(number=norm_num(m.group(1)), slug=m.group(2), dir=f'.planning/milestones/{md}/{d}', archived=True, milestone=ver)
+
+    # 2. ROADMAP: milestone names/ranges and phase titles (live + archived roadmaps).
+    ms_names, ms_ranges, ms_sections = {}, {}, {}
+    titles, deploys = {}, {}
+    roadmaps = [os.path.join(pl, 'ROADMAP.md')] + sorted(
+        os.path.join(ms_dir, f) for f in (os.listdir(ms_dir) if os.path.isdir(ms_dir) else []) if f.endswith('-ROADMAP.md'))
+    for rp in roadmaps:
+        if not os.path.exists(rp):
+            continue
+        is_main = rp.endswith('/ROADMAP.md')
+        last_ms = section = progress = None
+        prev_int = None
+        for line in open(rp, encoding='utf-8'):
+            line = line.rstrip('\n')
+            m = MS_LINE.match(line)
+            if m and is_main:
+                last_ms = m.group(1)
+                ms_names[last_ms] = m.group(2).split(' — ')[0].strip()
+                ms_ranges.setdefault(last_ms, set()).update(parse_ranges(m.group(3)))
+            m = MS_SUB.match(line)
+            if m and is_main:
+                titles.setdefault(norm_key(m.group(1)), m.group(2).strip())  # title only: sub-bullets sit out of order
+            m = SECTION_HDR.match(line)
+            if m and is_main:
+                section, prev_int, progress = m.group(1), None, None
+            elif line.startswith('### ') or line.startswith('## '):
+                if not PHASE_HDR.match(line):
+                    section = None
+                m2 = PROGRESS_HDR.match(line)
+                progress = m2.group(1) if m2 else None
+            m = PROGRESS_ROW.match(line)
+            if m and progress and is_main:
+                ms_ranges.setdefault(progress, set()).add(norm_key(m.group(1)))
+            m = CHECKBOX.match(line)
+            if m:
+                titles.setdefault(norm_key(m.group(1)), m.group(2).strip())
+            m = PHASE_HDR.match(line)
+            if m:
+                k = norm_key(m.group(1))
+                titles.setdefault(k, m.group(2))
+                p = PROD_ID.search(line)
+                if p:
+                    deploys.setdefault(k, p.group(1))
+                if section and is_main:
+                    n = int(re.match(r'\d+', k).group(0))
+                    if prev_int is not None and n - prev_int > 1:
+                        section = None
+                    else:
+                        prev_int = n
+                        ms_sections.setdefault(section, set()).add(k)
+
+    # 3. Dates from one git pass.
+    # --name-status -M so an archive move (R) never counts as the landing date.
+    log = run(['git', 'log', '--format=%x01%as', '--name-status', '-M', '--', '.planning'], repo)
+    first, last_summary, last_any = {}, {}, {}
+    date = None
+    for line in log.splitlines():
+        if line.startswith('\x01'):
+            date = line[1:]
+            continue
+        if not line.strip():
+            continue
+        parts = line.split('\t')
+        status, fpath = parts[0][0], parts[-1]
+        m = re.search(r'/(\d+(?:\.\d+)?[A-Za-z]?)-([^/]+)/([^/]+)$', fpath)
+        if not m or '/quick/' in fpath:
+            m2 = re.search(r'/quick/([^/]+)/', fpath)
+            if m2:
+                qk = m2.group(1)
+                first[('q', qk)] = date  # log is newest-first; last write wins = oldest
+                if status != 'R':
+                    last_any.setdefault(('q', qk), date)
+            continue
+        k = norm_key(m.group(1))
+        first[k] = date
+        if status == 'R':
+            continue
+        last_any.setdefault(k, date)
+        if re.search(r'SUMMARY\.md$|VERIFICATION\.md$', m.group(3)):
+            last_summary.setdefault(k, date)
+
+    # 4. Status and milestone per phase.
+    report = defaultdict(list)
+    for k, p in phases.items():
+        files = os.listdir(os.path.join(repo, p['dir']))
+        plans = [f for f in files if re.search(r'-\d+[a-z]?-PLAN\.md$', f)]
+        sums = [f for f in files if re.search(r'-\d+[a-z]?-SUMMARY\.md$', f)]
+        ctx = [f for f in files if re.search(r'CONTEXT\.md$|RESEARCH\.md$|DECISION\.md$', f)]
+        title = titles.get(k, '')
+        if p['archived']:
+            status = 'archived'
+        elif plans and len(sums) >= len(plans):
+            status = 'landed'
+        elif sums:
+            status = 'executing'
+        elif plans:
+            status = 'planned'
+        elif ctx:
+            status = 'grilled'
+        elif SHIPPED_WORDS.search(title) and not DEFER_WORDS.search(title):
+            status = 'landed'; report['landed-without-plans (shipped elsewhere per roadmap)'].append(k)
+        else:
+            status = 'deferred'; report['deferred (empty dir)'].append(k)
+        if status in ('grilled', 'planned') and DEFER_WORDS.search(title):
+            status = 'deferred'; report['deferred (roadmap says obsolete/superseded)'].append(k)
+        p['status'] = status
+        p['plans'] = len(plans); p['sums'] = len(sums)
+        p['goal'] = clean_title(title) if title else p['slug'].replace('-', ' ')
+        if not title:
+            report['goal from slug (no roadmap title)'].append(k)
+        if p['milestone'] is None:
+            for src in (ms_ranges, ms_sections):
+                for ver, keys in src.items():
+                    if k in keys and p['milestone'] is None:
+                        p['milestone'] = ver
+            if p['milestone'] is None:
+                parent = re.match(r'^(\d+)[.A-Za-z]', k)
+                if parent and parent.group(1) in phases and phases[parent.group(1)].get('milestone'):
+                    p['milestone'] = phases[parent.group(1)]['milestone']
+            if p['milestone'] is None:
+                report['no milestone'].append(k)
+        p['created'] = first.get(k)
+        p['landed'] = (last_summary.get(k) or last_any.get(k)) if status in ('landed', 'archived') else None
+        p['deploy'] = deploys.get(k)
+        if not p['created']:
+            report['no git date'].append(k)
+
+    # 5. Quick tasks.
+    quick = []
+    qdir = os.path.join(pl, 'quick')
+    if os.path.isdir(qdir):
+        for d in sorted(os.listdir(qdir)):
+            m = QUICK_DIR.match(d)
+            if not m or not os.path.isdir(os.path.join(qdir, d)):
+                continue
+            files = os.listdir(os.path.join(qdir, d))
+            st = 'landed' if any(f.endswith('SUMMARY.md') for f in files) else ('planned' if any(f.endswith('PLAN.md') for f in files) else 'deferred')
+            quick.append(dict(id=m.group(1), slug=m.group(2), status=st, date=first.get(('q', d)), dir=f'.planning/quick/{d}'))
+
+    # 6. Current phase and milestone from STATE.md.
+    state_md = open(os.path.join(pl, 'STATE.md'), encoding='utf-8').read() if os.path.exists(os.path.join(pl, 'STATE.md')) else ''
+    cur = re.search(r'^Phase:\s*(\d+(?:\.\d+)?[A-Za-z]?)', state_md, re.M)
+    cur = cur.group(1) if cur else None
+    ms = re.search(r'^milestone:\s*(\S+)', state_md, re.M)
+    ms = ms.group(1) if ms else None
+    ms_name = re.search(r'^milestone_name:\s*(.+)$', state_md, re.M)
+    ms_goal = args.milestone_goal or (ms_name.group(1).strip() if ms_name else ms_names.get(ms, ''))
+    for k, p in phases.items():
+        if p['milestone'] is None and ms and k in ms_ranges.get(ms, set()):
+            p['milestone'] = ms
+
+    def sort_key(p):
+        m = re.match(r'^(\d+)(?:\.(\d+))?([A-Za-z]?)$', p['number'])
+        return (int(m.group(1)), int(m.group(2) or 0), m.group(3).lower())
+
+    out = []
+    out.append('# holden state. Mechanical facts only; reasons live in ledger.md and each phase\'s DECISION.md.')
+    out.append('# Generated by ~/.claude/holden/bin/gsd-state from the GSD phase directories, ROADMAP.md and git.')
+    out.append('# Phases converted from GSD carry review null and models {}: they ran under the GSD process, which')
+    out.append('# had no tier. Status deferred marks a directory the roadmap parked or never planned.')
+    out.append('holden: 1')
+    out.append(f'project: {project}')
+    out.append('milestone:')
+    out.append(f'  name: {ms}')
+    out.append(f'  goal: {q(ms_goal)}')
+    out.append(f'  opened: {args.milestone_opened or "null"}')
+    out.append(f'current_phase: {cur}')
+    out.append('phases:')
+    for p in sorted(phases.values(), key=sort_key):
+        out.append(f'  - number: {p["number"]}')
+        out.append(f'    slug: {p["slug"]}')
+        out.append(f'    milestone: {p["milestone"] or "null"}')
+        out.append(f'    status: {p["status"]}')
+        out.append(f'    goal: {q(p["goal"])}')
+        out.append('    review: null')
+        out.append('    models: {}')
+        out.append(f'    created: {p["created"] or "null"}')
+        out.append(f'    landed: {p["landed"] or "null"}')
+        out.append('    full_suite: null')
+        out.append('    tested: null')
+        out.append(f'    deploy: {p["deploy"] or "null"}')
+        out.append(f'    dir: {p["dir"]}')
+    if quick:
+        out.append('quick:')
+        for qq in quick:
+            out.append(f'  - id: {qq["id"]}')
+            out.append(f'    slug: {qq["slug"]}')
+            out.append(f'    status: {qq["status"]}')
+            out.append(f'    date: {qq["date"] or "null"}')
+            out.append(f'    dir: {qq["dir"]}')
+    else:
+        out.append('quick: []')
+    text = '\n'.join(out) + '\n'
+
+    print(f'phases: {len(phases)} ({sum(1 for p in phases.values() if p["archived"])} archived), quick: {len(quick)}, current: {cur}, milestone: {ms}')
+    from collections import Counter
+    print('status:', dict(Counter(p['status'] for p in phases.values())))
+    for kind, ks in report.items():
+        print(f'{kind}: {len(ks)}: {" ".join(ks)}')
+    if args.dry_run:
+        sys.stdout.write(text)
+    else:
+        with open(os.path.join(repo, args.out), 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f'wrote {args.out}')
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,1266 @@
+#!/usr/bin/env node
+'use strict';
+// h-queue: the package registry of one repo and its locks. No daemon: every command locks,
+// decides and unlocks. The registry is <git common dir>/holden-registry.json, never committed.
+//   h-queue admit <id> --kind plan|quick|fix --owner phase:<NNN>|quick:<id> [--plan <PLAN.md>]
+//                 [--writes p...] [--reads p...] [--ledger <file>]   reserve, take the base, make the worktree
+//                 with --plan, a parked package reserves the plan's files: and reads: as they are now
+//                 with --kind quick, prints `importer roots: ...` of --writes before the worktree line, a warning
+//   h-queue extend <id> <path>...        reserve more paths for a running package (0 granted, 70 wait, 71 yield)
+//   h-queue beat <dir>                   heartbeat for the package whose worktree holds <dir>
+//   h-queue status [--json] [--summary]  one line per package in flight, old metadata tokens, the count of
+//                                        deferred stamps not yet written when there is one (h-queue stamps), then
+//                                        the recent decisions; --summary prints the packages line and that count;
+//                                        replays a pending metadata journal when the landing lock is free
+//   h-queue stamps [--ledger <file>]     each deferred stamp not yet written (phase 004 D06): a `stamp:` line of a
+//                                        completed task with no later `stamped:` line for its doc, in every ledger
+//                                        under paths.phases/*/ and paths.quick/*/, or in the one --ledger names;
+//                                        `pending:` while the ledger has no `## Result`, else `missed:`; exit 0
+//   h-queue lock [--next-phase NNN | --next-quick <dir name> | --ask-once <id>] -- <cmd>
+//                                        run <cmd> holding the landing lock; the checks run under it first
+//   h-queue freeze [--expect <sha>] -- <cmd>   the same lock for the final suite and the deploy
+//   h-queue meta open [--stamps] <file>...   copy each from HEAD into a new token; prints `token <t>`, one
+//                                        `work <path> <copy>` line per file and `new <dir>`; takes no lock.
+//                                        Only the shared files; with --stamps any file tracked at HEAD, for
+//                                        a doc's stamp written after a landing (phase 004 D05)
+//   h-queue meta commit <token> -m <msg> [--next-phase NNN] [--next-quick <dir name>] [--ask-once <id>] [--add <path>...]
+//                                        [--checked <sha>]
+//                                        under the landing lock: merge the copies onto HEAD, check them, publish
+//                                        one commit and write it into the tree (docs/reference.md § Shared files)
+//   h-queue meta abort <token>           delete a token and its copies
+//   h-queue land <id> [--ledger <file>] [--reads-hold <text>]   under the landing lock: rule on undeclared
+//                                        paths and changed reads, land through h-worktree, write the receipt
+//   h-queue yield <id> --reason <text>   drop the branch (uncommitted work kept as a patch) and park
+//   h-queue drop <id> --reason <text>    the same, counted as a drop (a conflict or a red merged tree)
+//   h-queue wait <id> [--poll <s>]       poll until a parked package is admitted again (prints its
+//                                        worktree) or a waiting one is granted its path; 74 after 4 hours
+//   h-queue resume <id>                  a crashed session's package: yield it (head and patch recorded)
+//                                        and admit it again from this session
+//   h-queue retire <id> --reason <text>  a parked package that will never run: delete its record, keep its patch and ledger
+// Exit: 0 ok, 1 refused or failed, 2 usage, 70 not admitted: wait (h-queue wait <id>), 71 yield
+// (drop and park), 73 a check under the lock failed (HEAD, next number, ask, a merge
+// conflict, an uncommitted shared file; the printed line says which), 74 gave up after
+// 4 hours (wait), 75 the landing lock stayed busy for the wait window, 76 a declared read changed
+// since the base (the gate reviewer rules; land again with --reads-hold). land passes h-worktree
+// land's 3, 4, 5, 6 and 75 through. A wrapped command's own exit code passes through; a command of
+// your own must not use 70-76.
+const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process'), crypto = require('crypto');
+const yaml = require(path.join(__dirname, '..', 'lib', 'yaml-lite.js'));
+const R = require(path.join(__dirname, '..', 'lib', 'registry.js'));
+const I = require(path.join(__dirname, '..', 'lib', 'importers.js'));
+const M = require(path.join(__dirname, '..', 'lib', 'meta.js'));
+const G = require(path.join(__dirname, '..', 'hooks', 'holden-executor-git-guard.js'));
+const { aloneFile } = require(path.join(__dirname, '..', 'lib', 'manifests.js'));
+const { alive } = require(path.join(__dirname, '..', 'lib', 'worktrees.js'));
+
+const argv = process.argv.slice(2), dd = argv.indexOf('--');
+const args = dd < 0 ? argv : argv.slice(0, dd), afterDd = dd < 0 ? [] : argv.slice(dd + 1);
+const cmd = args[0];
+const flag = name => { const i = args.indexOf(name); return i < 0 ? null : (args[i + 1] || ''); };
+const list = name => { const out = []; let i = args.indexOf(name); if (i < 0) return out; while (args[i + 1] && !args[i + 1].startsWith('-')) out.push(args[++i]); return out; };
+const HELP = (() => { const ls = fs.readFileSync(__filename, 'utf8').split('\n').slice(2); return ls.slice(0, ls.findIndex(l => !l.startsWith('//'))).join('\n'); })();
+
+function sh(c, o = {}) { return cp.execSync(c, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...o }).trim(); }
+function trySh(c, o = {}) { try { return { ok: true, out: sh(c, o) }; } catch (e) { return { ok: false, out: ((e.stdout || '') + (e.stderr || '')).trim() }; } }
+const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const err = m => console.error('h-queue: ' + m);
+const now = () => new Date().toISOString();
+const uniq = xs => [...new Set(xs)];
+const norm = p => path.posix.normalize(String(p)).replace(/^\.\//, '');
+const usage = () => { console.error(HELP); return 2; };
+
+const H = path.join(__dirname, 'h-worktree');
+const C = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+// Coordination config is the main checkout's, never a worktree's (D02): an old worktree's config
+// must not switch coordination off.
+const rootOf = cwd => R.mainRoot(cwd);
+function config(root) { const f = path.join(root, '.holden', 'config.yaml'); return fs.existsSync(f) ? yaml.load(f) : {}; }
+
+const ID_RE = /^[A-Za-z0-9][\w.-]*$/, OWNER_RE = /^(phase:[\w.]+|quick:[\w.-]+)$/, KINDS = ['plan', 'quick', 'fix'];
+// D04 (phase 002): the shared files, defined once. meta open accepts only these (any tracked file with --stamps), meta commit's
+// D03 check reads every one, and admit, extend and land refuse a package that writes one.
+const SHARED = ['.planning/state.yaml', '.planning/asks.yaml', '.planning/OPEN-ASKS.md', '.planning/ledger.md',
+  '.holden/radius.yaml', '.holden/config.yaml', 'docs/CONTEXT.md', 'CLAUDE.md'];
+const ST_FILE = '.planning/state.yaml';
+const sharedIn = ps => ps.filter(p => SHARED.includes(p));
+const sharedRefusal = ps => `shared files are committed in the main checkout through h-queue meta commit (phase 002 D01), never by a package: ${ps.join(', ')}`;
+
+// The driver's transcript, ~/.claude/projects/<slug>/<session>.jsonl: plan 4's staleness reads its mtime.
+function transcriptOf(session) {
+  if (!session) return null;
+  const d = path.join(C, 'projects');
+  let dirs = []; try { dirs = fs.readdirSync(d); } catch (e) { return null; }
+  for (const x of dirs) { const f = path.join(d, x, `${session}.jsonl`); if (fs.existsSync(f)) return f; }
+  return null;
+}
+
+// A quick's size limit (skills/h-quick/SKILL.md step 2): the top-level directories whose code imports
+// a file of its --writes, printed as a warning the operator may overrule. A hint only: a shared module
+// reaches every root, a dynamic import none.
+function rootsLine(root, files) {
+  const pats = ((config(root).tests || {}).test_file_patterns || ['tests/**']).map(I.globToRe);
+  const roots = I.importerRoots(files, { cwd: root, isTest: f => pats.some(re => re.test(f)) });
+  return roots.length ? `importer roots: ${roots.join(', ')} (a warning: a quick's goal shows from one entry point; the operator may overrule)` : 'importer roots: none';
+}
+
+// `before`: lines printed after the admission line and before the worktree path (resume's record).
+// wait and resume call this with their own argv, whose id is args[1] too and which has no admit flags.
+async function admit(before = []) {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null;
+  const kindF = flag('--kind'), ownerF = flag('--owner'), planF = flag('--plan'), ledgerF = flag('--ledger');
+  if (!id || !ID_RE.test(id) || (kindF !== null && !KINDS.includes(kindF)) || (ownerF !== null && !OWNER_RE.test(ownerF))) return usage();
+  const root = rootOf(process.cwd());
+  if (config(root).concurrency !== true) { err(`concurrency is off in ${path.join(root, '.holden', 'config.yaml')}; packages are admitted only with concurrency: true (D02)`); return 1; }
+  let writes = list('--writes').map(norm), reads = list('--reads').map(norm);
+  if (planF !== null) {
+    if (!planF || !fs.existsSync(planF)) { err(`no plan at ${planF}`); return 1; }
+    const m = fs.readFileSync(planF, 'utf8').match(/^---\n([\s\S]*?)\n---/);
+    const fm = m ? yaml.parse(m[1]) : {};
+    if (!Array.isArray(fm.files)) { err(`no files: in ${planF}`); return 1; }
+    writes = uniq([...fm.files.map(norm), ...writes]);
+    reads = uniq([...(Array.isArray(fm.reads) ? fm.reads.map(norm) : []), ...reads]);
+  }
+  const shared = sharedIn(writes); if (shared.length) { err(sharedRefusal(shared)); return 1; }
+  // Before the landing lock: a git grep per file under it would hold up every landing. wait and
+  // resume call admit with their own argv, which has no --kind and no --writes: a re-admission prints none.
+  const flagWrites = list('--writes').map(norm);
+  const roots = kindF === 'quick' && flagWrites.length ? rootsLine(root, flagWrites) : null;
+
+  const P = R.paths(root);
+  const L = await R.holdLock(P.landingLock, R.WAIT_MAX_S, 'landing');
+  if (!L) { err('the landing lock stayed busy for 4 hours; ask the operator'); return 75; }
+  try {
+    for (const l of M.replayJournal(root)) console.log(l);
+    // The record before this admit: a failed worktree restores it (a parked package stays parked).
+    let prev = null;
+    const res = await R.withRegistry(root, async reg => {
+      const old = reg.packages[id];
+      prev = old ? JSON.parse(JSON.stringify(old)) : null;
+      if (old && (old.state === 'admitted' || old.state === 'waiting') && old.worktree) return { already: old.worktree };
+      if (old && old.state === 'landed') return { refuse: `${id} landed at ${String(old.candidate || 'an unrecorded sha').slice(0, 7)}; a new package needs a new id` };
+      // A record with no worktree is the after-reserve crash: finish it with its own base and seq.
+      if (old && old.state === 'admitted') return { reserved: old };
+      if (old && old.state !== 'parked') return { refuse: `${id} is ${old.state}; it cannot be admitted again` };
+      const kind = kindF || (old && old.kind), owner = ownerF || (old && old.owner);
+      if (!kind || !owner) return { usage: true };
+      // A re-admission with --plan reserves what the plan declares now (quick 261021 D03): nothing
+      // carries over from the parked record, an extend included; the re-run asks for that again
+      // (phase 001 D10). Without --plan (wait, resume, a bare admit) it reserves the stored
+      // declaration: a park emptied `writes`, never `declared`.
+      const pkg = old || { id, seq: null, yields: 0, drops: 0, head: null, patch: null };
+      const fresh = !!old && planF !== null;
+      const declared = fresh ? [...writes] : uniq([...(pkg.declared || []), ...writes]);
+      const dropped = fresh ? (pkg.declared || []).filter(p => !declared.includes(p)) : [];
+      Object.assign(pkg, { id, kind, owner, declared, reads: fresh ? [...reads] : uniq([...(pkg.reads || []), ...reads]),
+        plan: planF ? path.resolve(planF) : (pkg.plan || null), ledger: ledgerF ? path.resolve(ledgerF) : (pkg.ledger || null) });
+      reg.packages[id] = pkg;
+      const cr = await conflictsResolved(root, reg, pkg, pkg.declared), c = cr.conflicts;
+      if (cr.failed) {
+        if (prev) reg.packages[id] = prev; else delete reg.packages[id];
+        return { refuse: `${id} not admitted: the stale holder could not be yielded`, lines: cr.lines };
+      }
+      if (c.length) {
+        const { how, path: p, holder } = R.verdict(pkg, c);
+        const text = `${how} on ${holder.id} for ${p}${aloneFile(p) || holder.alone === p ? ' (manifest rule)' : ''}`;
+        Object.assign(pkg, { state: 'parked', writes: [], waits_on: { id: holder.id, path: p }, since: now() });
+        delete pkg.narrowed;
+        // Stored as parked again in this write, so the narrowing is logged with it (D03).
+        if (dropped.length) R.event(reg, 'narrowed', id, `dropped ${dropped.join(', ')}`);
+        R.event(reg, 'parked', id, text);
+        return { parked: text, lines: cr.lines, dropped };
+      }
+      if (pkg.seq == null) pkg.seq = ++reg.seq;
+      Object.assign(pkg, { state: 'admitted', writes: [...pkg.declared], alone: pkg.declared.find(aloneFile) || false,
+        base: sh(`git -C ${q(root)} rev-parse HEAD`), worktree: null, waits_on: null, since: now(), heartbeat: now() });
+      // Logged by the write that stores the worktree, below: a failed worktree puts the parked
+      // record back and logs nothing; a crash before it leaves this for the admit that finishes it.
+      if (dropped.length) pkg.narrowed = dropped; else delete pkg.narrowed;
+      return { reserved: pkg, lines: cr.lines };
+    });
+    if (res.usage) return usage();
+    for (const l of res.lines || []) console.log(l);
+    if (res.already) { if (roots) console.log(roots); console.log(`already admitted ${id}`); console.log(res.already); return 0; }
+    if (res.refuse) { err(res.refuse); return 1; }
+    if (res.parked) {
+      if (roots) console.log(roots);
+      if (res.dropped && res.dropped.length) console.log(`narrowed ${id}: dropped ${res.dropped.join(', ')}`);
+      console.log(`parked ${id}: ${res.parked}; run h-queue wait ${id}`);
+      return 70;
+    }
+    R.crashAt('after-reserve');
+    const pkg = res.reserved;
+    // Still under the landing lock: nothing lands between the base read and the worktree (D07).
+    const r = cp.spawnSync(process.execPath, [H, 'add', id, '--base', pkg.base], { cwd: root, encoding: 'utf8', env: process.env });
+    if (r.status !== 0) {
+      await R.withRegistry(root, reg => {
+        if (prev && prev.state === 'parked') reg.packages[id] = prev; else delete reg.packages[id];
+        R.event(reg, 'refused', id, 'h-worktree add failed');
+      });
+      process.stdout.write((r.stdout || '') + (r.stderr || ''));
+      err(`${id} not admitted: h-worktree add failed`);
+      return 1;
+    }
+    const wt = r.stdout.trim().split('\n').pop();
+    const session = process.env.CLAUDE_CODE_SESSION_ID || null, t = now();
+    let narrowed = [];
+    await R.withRegistry(root, reg => {
+      const p = reg.packages[id];
+      Object.assign(p, { worktree: wt, branch: 'holden/' + id, state: 'admitted', session, transcript: transcriptOf(session),
+        admitted: t, heartbeat: t, since: t, reads_ruling: null });
+      narrowed = p.narrowed || [];
+      delete p.narrowed;
+      if (narrowed.length) R.event(reg, 'narrowed', id, `dropped ${narrowed.join(', ')}`);
+      R.event(reg, 'admitted', id, `base ${p.base.slice(0, 7)} writes ${p.writes.length} reads ${p.reads.length}`);
+    });
+    if (narrowed.length) console.log(`narrowed ${id}: dropped ${narrowed.join(', ')}`);
+    if (prev && prev.state === 'parked') console.log(`re-admitted ${id} base ${pkg.base.slice(0, 7)} (yields ${pkg.yields || 0}, drops ${pkg.drops || 0})`);
+    else console.log(`admitted ${id} base ${pkg.base.slice(0, 7)} writes ${pkg.writes.length} reads ${pkg.reads.length}`);
+    for (const l of roots ? [roots, ...before] : before) console.log(l);
+    console.log(wt);
+    return 0;
+  } finally { await L.release(); }
+}
+
+// D11: staleness is read when it matters, here, where another package needs a file: a stale holder
+// keeps everything until then, then yields through parkPackage (D05) under the registry lock the
+// caller holds, so a second requester finds it already parked. What is left is decided by rank.
+// `failed`: a stale holder's drop failed, nothing is granted. Callers: admit, extendPaths, wait.
+async function conflictsResolved(root, reg, pkg, ps) {
+  const lines = [];
+  for (;;) {
+    const c = R.conflicts(reg, pkg, ps);
+    const hit = c.find(x => x.holder.id !== pkg.id && R.isStale(x.holder));
+    if (!hit) return { conflicts: c, lines };
+    const h = hit.holder;
+    const why = `stale: no heartbeat or transcript change since ${new Date(R.lastActivity(h)).toISOString()}; yielded for ${pkg.id} on ${hit.path}`;
+    const r = await parkPackage(root, h.id, why, 'yields', { reg });
+    lines.push(...r.lines);
+    if (r.code !== 0) return { conflicts: c, lines, failed: true };
+  }
+}
+
+// D10: a path beyond the declaration is granted when free; held by another owner, rank decides.
+// Paths go in order and the first conflict stops; what was granted before it stays reserved.
+// Plan 3's landing calls this for the undeclared paths of a diff.
+async function extendPaths(root, reg, rec, ps) {
+  const lines = [];
+  for (const p of ps) {
+    let c = [];
+    if (!(rec.writes || []).includes(p)) {
+      const cr = await conflictsResolved(root, reg, rec, [p]);
+      lines.push(...cr.lines);
+      if (cr.failed) { lines.push(`${rec.id} not granted ${p}: the stale holder could not be yielded`); return { lines, code: 1 }; }
+      c = cr.conflicts;
+    }
+    if (!c.length) {
+      rec.writes = uniq([...(rec.writes || []), p]); rec.declared = uniq([...(rec.declared || []), p]);
+      if (aloneFile(p)) rec.alone = p;
+      lines.push(`granted ${p}`); continue;
+    }
+    const { how, path: at, holder } = R.verdict(rec, c), rule = aloneFile(at) || holder.alone === at ? ' (manifest rule)' : '';
+    if (how === 'wait') {
+      Object.assign(rec, { state: 'waiting', waits_on: { id: holder.id, path: at }, since: now() });
+      R.event(reg, 'waiting', rec.id, `on ${holder.id} for ${at}${rule}`);
+      lines.push(`wait ${holder.id} ${at}; run h-queue wait ${rec.id}`);
+      return { lines, code: 70 };
+    }
+    R.event(reg, 'yield', rec.id, `to ${holder.id} for ${at}${rule}`);
+    lines.push(`yield ${holder.id} ${at}; run h-queue yield ${rec.id}`);
+    return { lines, code: 71 };
+  }
+  return { lines, code: 0 };
+}
+
+async function extend() {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null, ps = uniq(args.slice(2).map(norm));
+  if (!id || !ps.length) return usage();
+  const root = rootOf(process.cwd());
+  const res = await R.withRegistry(root, async reg => {
+    const rec = reg.packages[id];
+    if (!rec) return { refuse: `no package ${id} in the registry` };
+    if (rec.state !== 'admitted' && rec.state !== 'waiting') return { refuse: `${id} is ${rec.state}` };
+    const shared = sharedIn(ps); if (shared.length) return { refuse: sharedRefusal(shared) };
+    rec.heartbeat = now();
+    return extendPaths(root, reg, rec, ps);
+  });
+  if (res.refuse) { err(res.refuse); return 1; }
+  for (const l of res.lines) console.log(l);
+  return res.code;
+}
+
+// Never prints and always exits 0: bin/h-test, bin/h-machine and bin/h-worktree (plans 2-3) call
+// it on every run, in repos with or without packages.
+async function beat() {
+  // bin/h-worktree drop beats on every call; one run by conflictsResolved inside the registry lock
+  // would otherwise wait for the lock its own parent holds, up to beat's 10 s cap.
+  if (process.env.HOLDEN_REGISTRY_HELD === '1') return 0;
+  try {
+    const dir = args[1]; if (!dir) return 0;
+    const top = trySh(`git -C ${q(dir)} rev-parse --show-toplevel`); if (!top.ok) return 0;
+    const root = rootOf(dir);
+    // A lockless look first: a dir with no package costs no lock and writes no registry file.
+    const mine = reg => Object.values(reg.packages || {}).find(p => p.worktree === top.out);
+    if (!mine(R.readRegistry(root))) return 0;
+    await R.withRegistry(root, reg => { const p = mine(reg); if (p) p.heartbeat = now(); });
+  } catch (e) {}
+  return 0;
+}
+
+const minute = iso => iso ? String(iso).slice(0, 16) : '-';
+// D07: a token older than this is shown with its abort command; nothing deletes one on its own.
+const META_OLD_MS = 24 * 60 * 60 * 1000;   // 24 hours, D07
+// The age is token.json's `opened` (metaOpen's now(), an ISO string in UTC), else the directory's
+// mtime. A token's work copies are not read: they may be the only copy of a session's edit (D07).
+function oldTokens(root, t) {
+  let names = []; try { names = fs.readdirSync(M.dirOf(root)); } catch (e) { return []; }
+  return names.filter(n => M.TOKEN_RE.test(n)).map(n => {
+    const d = path.join(M.dirOf(root), n); let tk = {};
+    try { tk = JSON.parse(fs.readFileSync(path.join(d, 'token.json'), 'utf8')); } catch (e) {}
+    let at = Date.parse(tk.opened || '');
+    // A token a meta commit or abort deletes between the readdir and here is no longer a token.
+    if (Number.isNaN(at)) { try { at = fs.statSync(d).mtimeMs; } catch (e) { return null; } }
+    return { token: n, opened: at, files: Array.isArray(tk.files) ? tk.files : [] };
+  }).filter(x => x && t - x.opened > META_OLD_MS);
+}
+const NEXT = {
+  admitted: p => `runs; lands with h-queue land ${p.id}`,
+  waiting: p => `granted when ${p.waits_on ? p.waits_on.id : '?'} lands; h-queue wait ${p.id}`,
+  parked: p => `re-admitted when ${p.waits_on ? p.waits_on.id : '?'} lands; h-queue wait ${p.id}`,
+};
+// Quick 261025 D04: a stuck parked quick's package has a command for the operator's decision.
+// Retire refuses a phase's package and a waiting one (bin/h-queue retire), so they keep the bare text.
+const stuckNext = p => p.state === 'parked' && String(p.owner || '').startsWith('quick:')
+  ? `over 4 hours: the operator decides; h-queue retire ${p.id} --reason <text> forgets it` : 'over 4 hours: the operator decides';
+function diffOf(wt) {
+  if (!wt) return '-';
+  const r = trySh(`git -C ${q(wt)} diff --stat`);
+  return !r.ok ? 'unreadable' : (r.out.split('\n').pop().trim() || 'clean');
+}
+// D11: status reads staleness and never acts on it (a stale package yields only when its file is
+// needed). Its writes are bookkeeping: clearing a freeze whose process died, which no landing could
+// otherwise lift, and replaying a pending metadata journal while the landing lock is free.
+async function status() {
+  const root = rootOf(process.cwd());
+  // D01: a pending journal is replayed here only while this process holds the landing lock, so the
+  // replay never races a live meta commit between its JOURNAL write and its update-ref.
+  let pending = [];
+  if (fs.existsSync(M.journalOf(root))) {
+    const L = await R.holdLock(R.paths(root).landingLock, 0, 'status');
+    // An unreadable journal is a line here, not an exit: status is where the operator looks next.
+    if (L) { try { pending = M.replayJournal(root); } catch (e) { pending = [e.message]; } finally { await L.release(); } }
+    else pending = ['metadata journal pending; the next locked h-queue command replays it'];
+  }
+  let reg = R.readRegistry(root);
+  const deadFreeze = f => !!f && Number.isInteger(f.pid) && !alive(f.pid);
+  if (deadFreeze(reg.freeze)) {
+    await R.withRegistry(root, g => { if (deadFreeze(g.freeze)) { R.event(g, 'thaw', '-', `${g.freeze.label}: the freeze's process died`); g.freeze = null; } });
+    reg = R.readRegistry(root);
+  }
+  if (args.includes('--json')) { console.log(JSON.stringify(reg, null, 2)); return 0; }
+  // Phase 004 D06: the deferred stamps not yet written, one line, only when there is one, so a repo with
+  // nothing to stamp reads as before (the --summary pins of tests/h-queue-meta.test.js).
+  const st = stampScan(root, ledgersUnder(root));
+  const stLine = st.missed + st.pending ? `stamps: ${st.missed} missed, ${st.pending} pending; h-queue stamps lists them` : null;
+  const t = Date.now(), live = R.inFlight(reg), parked = Object.values(reg.packages || {}).filter(p => p.state === 'parked');
+  const count = st => live.filter(p => p.state === st).length;
+  const stale = live.filter(p => R.isStale(p, t)).length, stuck = [...live, ...parked].filter(p => R.isStuck(p, t)).length;
+  if (args.includes('--summary')) {
+    console.log(live.length + parked.length ? `packages: ${count('admitted')} running, ${count('waiting')} waiting, ${parked.length} parked, ${stale} stale, ${stuck} stuck; /h-queue for the list` : 'packages: none');
+    if (stLine) console.log(stLine);
+    return 0;
+  }
+  for (const l of pending) console.log(l);
+  if (reg.freeze) console.log(`frozen: ${reg.freeze.label} since ${minute(reg.freeze.since)}`);
+  const rows = [...live, ...parked];
+  if (!rows.length) console.log('packages: none');
+  for (const p of rows) {
+    const isStale = R.isStale(p, t), isStuck = R.isStuck(p, t), landing = !!p.pending;
+    // Stuck is D04's operator question, so it outranks stale's automatic yield.
+    // lib/registry.js isStale never yields a record with `pending`: the landing is finished, not re-run.
+    const next = landing ? `a landing to finish: h-queue land ${p.id} completes it from git` : isStuck ? stuckNext(p) : isStale ? `yields when another package needs its file; h-queue resume ${p.id} re-admits it` : NEXT[p.state](p);
+    // Without a transcript only heartbeats count (lib/registry.js lastActivity): the reason it may go stale.
+    const tr = (p.state === 'admitted' || p.state === 'waiting') && !p.transcript ? ['transcript: none'] : [];
+    console.log([p.id, p.kind, p.owner, p.state + (landing ? ' landing' : '') + (isStale ? ' stale' : '') + (isStuck ? ' stuck' : ''), `since ${minute(p.since)}`,
+      p.waits_on ? `waits on ${p.waits_on.id} for ${p.waits_on.path}` : '-', `next: ${next}`, p.worktree || '-', `diff: ${diffOf(p.worktree)}`, ...tr].join('  '));
+  }
+  for (const x of oldTokens(root, t)) console.log(`metadata token ${x.token} opened ${minute(new Date(x.opened).toISOString())}${x.files.length ? ' (' + x.files.join(', ') + ')' : ''}: older than 24 hours; h-queue meta abort ${x.token} deletes it`);
+  if (stLine) console.log(stLine);
+  const ev = (reg.events || []).slice(-20);
+  if (ev.length) { console.log('recent:'); for (const e of ev) console.log(`${e.time} ${e.kind} ${e.id}: ${e.text}`); }
+  return 0;
+}
+
+// Phase 004 D06: the deferred stamps not yet written. A ledger's `stamp: <doc> task <N>: <entry>` line
+// (agents/holden-executor.md) counts when its task has a `Task <N>: complete` line, and the last such line
+// per doc and task counts (D03: a resumed executor writes the task again). It is written once a later
+// `stamped: <doc> <sha>` line names its doc (the orchestrator's, after it stamps). Ledgers are read by
+// path, never from the registry, so the scan works with concurrency off. An archived phase is outside
+// paths.phases; a dropped ledger (bin/h-worktree drop: <stem>-dropped-r<n>.md) no longer ends in LEDGER.md.
+const STAMP_RE = /^stamp: (\S+) task (\d+): (\S.*)$/, STAMPED_RE = /^stamped: (\S+) [0-9a-f]{7,40}\b/, DONE_RE = /^Task (\d+): complete\b/;
+function ledgersUnder(root) {
+  const p = config(root).paths || {}, out = [];
+  for (const base of [p.phases || '.planning/phases', p.quick || '.planning/quick']) {
+    let dirs = [];
+    try { dirs = fs.readdirSync(path.join(root, base), { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name).sort(); } catch (e) { continue; }
+    for (const d of dirs) {
+      let names = []; try { names = fs.readdirSync(path.join(root, base, d)); } catch (e) { continue; }
+      for (const n of names.filter(n => /LEDGER\.md$/.test(n)).sort()) out.push(path.join(root, base, d, n));
+    }
+  }
+  return out;
+}
+function stampScan(root, files) {
+  const lines = []; let missed = 0, pending = 0;
+  for (const f of files) {
+    const rel = path.relative(root, f).startsWith('..') ? f : path.relative(root, f);
+    let text;
+    try { text = fs.readFileSync(f, 'utf8'); } catch (e) { lines.push(`unreadable: ${rel}: ${e.code || e.message}`); missed++; continue; }
+    const ls = text.split('\n');
+    // No `## Result` yet: the executor is still running (agents/holden-executor.md § After the last task).
+    const running = !ls.some(l => /^## Result\s*$/.test(l));
+    const done = new Set(), last = new Map(), stampedAt = new Map();
+    ls.forEach((l, i) => {
+      let m;
+      if ((m = l.match(DONE_RE))) done.add(m[1]);
+      else if ((m = l.match(STAMP_RE))) last.set(`${norm(m[1])} ${m[2]}`, { i, doc: norm(m[1]), task: m[2], entry: m[3] });
+      else if ((m = l.match(STAMPED_RE))) stampedAt.set(norm(m[1]), i);
+      else if (l.startsWith('stamp: ') || l.startsWith('stamped: ')) { lines.push(`unreadable: ${rel}:${i + 1}: ${l}`); missed++; }
+    });
+    for (const e of [...last.values()].sort((a, b) => a.i - b.i)) {
+      if (!done.has(e.task) || (stampedAt.has(e.doc) && stampedAt.get(e.doc) > e.i)) continue;
+      lines.push(`${running ? 'pending' : 'missed'}: ${rel} ${e.doc} task ${e.task}: ${e.entry}`);
+      if (running) pending++; else missed++;
+    }
+  }
+  return { lines, missed, pending };
+}
+// The report; exit 0 whatever it finds. --ledger narrows it to one ledger: the orchestrator's list after a landing.
+function stamps() {
+  const root = rootOf(process.cwd()), lf = flag('--ledger');
+  if (lf === '') return usage();
+  let files = null;
+  if (lf !== null) { const f = path.resolve(lf); if (!fs.existsSync(f)) { err(`no ledger at ${lf}`); return 1; } files = [f]; }
+  const s = stampScan(root, files || ledgersUnder(root));
+  for (const l of s.lines) console.log(l);
+  console.log(s.missed + s.pending ? `stamps: ${s.missed} missed, ${s.pending} pending` : 'stamps: none');
+  return 0;
+}
+
+// One word after -- is a shell string; several are argv, quoted (bin/h-test's convention).
+const shq = w => /^[\w@%+=:,./-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`;
+const wrapped = () => afterDd.length === 1 ? afterDd[0] : afterDd.map(shq).join(' ');
+const holderOf = lockPath => { try { return fs.readFileSync(lockPath + '.holder', 'utf8').trim() || 'unknown'; } catch (e) { return 'unknown'; } };
+const atHead = (root, rel) => { const r = trySh(`git -C ${q(root)} show ${q('HEAD:' + rel)}`); return r.ok ? r.out : null; };
+const headState = root => { const t = atHead(root, '.planning/state.yaml'); return t ? (yaml.parse(t) || {}) : {}; };
+// A phase number as a key (quick 261019 D01): all digits is the integer as text, so 1, 01 and "001"
+// are one key; anything else is its text as written, so 12, 12.1, 18a and 15B are four keys.
+// An unquoted 35.10 arrives as the number 35.1 (lib/yaml-lite.js scalar), so it keys as 35.1.
+const phaseKey = n => { const s = String(n).trim(); return /^\d+$/.test(s) ? String(parseInt(s, 10)) : s; };
+// The next phase number (quick 261019 D02): the highest all-digit number among HEAD's state entries
+// and its `<digits>-` phase dirs, plus one, padded to three digits. A decimal or lettered phase is an
+// insert between integers, never the last one, so it does not count.
+function nextPhase(root, cfg) {
+  const nums = (headState(root).phases || []).map(p => phaseKey(p && p.number)).filter(k => /^\d+$/.test(k)).map(k => parseInt(k, 10));
+  const dir = (cfg.paths || {}).phases || '.planning/phases';
+  const ls = trySh(`git -C ${q(root)} ls-tree --name-only ${q('HEAD:' + dir)}`);
+  if (ls.ok) for (const n of ls.out.split('\n')) { const m = n.match(/^(\d+)-/); if (m) nums.push(parseInt(m[1], 10)); }
+  return String(Math.max(0, ...nums) + 1).padStart(3, '0');
+}
+
+// `lock`'s own checks of the next phase number, the quick id and the ask, under the lock. No holden
+// command passes them since phase 002 moved shared-file commits to `meta commit`, which runs its
+// own on the merged files (`metaChecks`). They stay for a wrapped command of the operator's.
+function checks(root, cfg) {
+  const np = flag('--next-phase'), nq = flag('--next-quick'), ask = flag('--ask-once');
+  if (np !== null) {
+    const expected = nextPhase(root, cfg);
+    if (String(np).padStart(3, '0') !== expected) return `next phase is ${expected}, not ${np}`;
+  }
+  if (nq !== null) {
+    const dir = (cfg.paths || {}).quick || '.planning/quick';
+    const inTree = trySh(`git -C ${q(root)} cat-file -e ${q(`HEAD:${dir}/${nq}`)}`).ok;
+    const inState = (headState(root).quick || []).some(e => e && (String(e.id) === nq || path.basename(String(e.dir || '')) === nq));
+    if (inTree || inState) return `quick ${nq} already exists at HEAD`;
+  }
+  if (ask !== null) {
+    let text = ''; try { text = fs.readFileSync(path.join(root, '.planning', 'asks.yaml'), 'utf8'); } catch (e) {}
+    const re = new RegExp(`^\\s*-\\s+id:\\s*["']?${ask.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*(#.*)?$`);
+    const n = text.split('\n').filter(l => re.test(l)).length;
+    if (n !== 1) return `ask ${ask} appears ${n} times in asks.yaml; one entry expected`;
+  }
+  return null;
+}
+
+// Starts argv held at a gate until the landing lock's holder has answered for its pid (L.watch),
+// so there is no moment when the command runs and the lock would still free with this process.
+// If this process dies first, the gate reads EOF and the command never starts. exec keeps the pid.
+function spawnWatched(L, argv, opts) {
+  const io = Array.isArray(opts.stdio) ? opts.stdio : [opts.stdio, opts.stdio, opts.stdio];
+  const child = cp.spawn('sh', ['-c', 'read -r _ <&3 || exit 1; exec 3<&-; exec "$@"', 'gate', ...argv], { ...opts, stdio: [...io, 'pipe'] });
+  const go = () => { const g = child.stdio[3]; if (g) { g.on('error', () => {}); g.end('go\n'); } };
+  R.crashAt('gate-before-go');
+  if (L && child.pid) L.watch(child.pid).then(go); else go();
+  return child;
+}
+
+// D04 (phase 002): the shared files a wrapped command stages. Each git add, stage, rm, mv and commit
+// segment is read; a nested `bash -c`, `eval` or one quoted shell word is judged as typed (the
+// guard's rule). Returns [{ seg, paths }]; staging the whole tree names every shared file.
+// A pathspec as a repo path: an absolute one made relative to the root, no trailing slash
+// (`path.posix.normalize('.planning/')` keeps it). Outside the root is null.
+// An absolute one through a symlink (`~/.claude/holden` links to the checkout) resolves to its real
+// path first: the longest existing prefix is realpath'd, the rest kept.
+const realAbs = p => { let d = p, tail = ''; while (d !== '/' && !fs.existsSync(d)) { tail = path.posix.join(path.posix.basename(d), tail); d = path.posix.dirname(d); } try { return path.posix.join(fs.realpathSync(d), tail); } catch { return p; } };
+const repoPath = (root, p) => { if (/^~(\/|$)/.test(p)) p = os.homedir() + p.slice(1); let r = path.posix.isAbsolute(p) ? path.posix.relative(realAbs(root), realAbs(p)) : p; r = norm(r).replace(/\/+$/, ''); return r.startsWith('..') ? null : r; };
+const COMMIT_VALUE = new Set(['-m', '--message', '-F', '--file', '-C', '--reuse-message', '-c', '--reedit-message', '--author', '--date', '-t', '--template', '--fixup', '--squash', '--cleanup', '--trailer']);
+function stagedShared(line, root, depth = 0) {
+  const out = [];
+  for (const seg of G.segments(line)) {
+    const argv = seg.slice(G.argStart(seg)); if (!argv.length) continue;
+    if (argv.length === 1 && /\s/.test(argv[0]) && depth < 3) { out.push(...stagedShared(argv[0], root, depth + 1)); continue; }
+    const prog = argv[0].split('/').pop();
+    if (['bash', 'sh', 'zsh'].includes(prog) && depth < 3) { const c = argv.findIndex(a => /^-\w*c$/.test(a)); if (c >= 0 && argv[c + 1]) out.push(...stagedShared(argv[c + 1], root, depth + 1)); continue; }
+    if (prog === 'eval' && depth < 3) { out.push(...stagedShared(argv.slice(1).join(' '), root, depth + 1)); continue; }
+    if (prog !== 'git') continue;
+    let k = 1, cwd = '';
+    while (k < argv.length && argv[k].startsWith('-')) { if (argv[k] === '-C') { cwd = path.posix.join(cwd, argv[k + 1] || ''); k += 2; } else if (argv[k] === '-c') k += 2; else k++; }
+    const sub = argv[k], rest = argv.slice(k + 1);
+    if (!['add', 'stage', 'rm', 'mv', 'commit'].includes(sub)) continue;
+    let whole = false; const specs = [];
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === '--') { specs.push(...rest.slice(i + 1)); break; }
+      if (a.startsWith('--pathspec-from-file')) { whole = true; continue; }
+      if (sub === 'commit' && /^-m./.test(a)) continue;   // -m<message>, attached
+      if (sub === 'commit' && (a === '--all' || /^-[A-Za-z]*a[A-Za-z]*$/.test(a))) { whole = true; continue; }
+      if (sub === 'commit' && COMMIT_VALUE.has(a)) { i++; continue; }
+      if (sub === 'commit' && /^-[A-Za-z]*[mFCct]$/.test(a)) { i++; continue; }
+      // -A and -u count clustered too: git takes `-Av` and `-vu` as the whole-tree forms.
+      if ((sub === 'add' || sub === 'stage') && (['--all', '--update'].includes(a) || /^-[A-Za-z]*[Au][A-Za-z]*$/.test(a))) { whole = whole || 'nospec'; continue; }
+      if (a.startsWith('-')) continue;
+      specs.push(a);
+    }
+    if (whole === 'nospec') whole = !specs.length;
+    const hit = new Set(whole ? SHARED : []);
+    for (const sp of specs) {
+      const full = repoPath(root, path.posix.join(cwd, sp));
+      if (full === null) continue;
+      if (sp.startsWith(':') || full === '.' || full === '') { SHARED.forEach(s => hit.add(s)); continue; }
+      const glob = full.search(/[*?[]/);
+      for (const s of SHARED) if (glob >= 0 ? s.startsWith(full.slice(0, glob)) : (s === full || s.startsWith(full + '/'))) hit.add(s);
+    }
+    if (hit.size) out.push({ seg: argv.join(' '), paths: [...hit] });
+  }
+  return out;
+}
+
+// `lock` and `freeze`: run the command holding the landing lock, after replaying a pending metadata
+// journal (phase 002 D01, D08), so no landing, admission or metadata transaction moves HEAD while
+// it runs, and no wrapped commit lands between a publish and its tree sync. HOLDEN_LANDING_HELD
+// marks a command already inside one, so a wrapped command that calls lock again does not wait on itself.
+async function underLanding(kind) {
+  if (dd < 0 || !afterDd.length) return usage();
+  const expect = flag('--expect');
+  if (expect !== null && !/^[0-9a-f]{7,40}$/i.test(expect)) { err('--expect needs a sha of 7 to 40 hex digits'); return 2; }
+  const root = rootOf(process.cwd()), cfg = config(root), label = flag('--label') || kind, cmd = wrapped();
+  // Before the lock, so a refusal waits on no landing.
+  const staged = stagedShared(cmd, root);
+  if (staged.length) { const s = staged[0]; err(`${kind} refuses \`${s.seg}\`: it stages ${s.paths.join(', ')}, shared; commit shared files with h-queue meta open <file>... then h-queue meta commit <token> -m <msg> (docs/reference.md § Shared files)`); return 1; }
+  const lockPath = R.paths(root).landingLock;
+  let L = null;
+  if (process.env.HOLDEN_LANDING_HELD !== '1') {
+    L = await R.holdLock(lockPath, R.WAIT_MAX_S, label);
+    if (!L) { err(`the landing lock stayed busy for 4 hours (held by ${holderOf(lockPath)}); ask the operator`); return 75; }
+  }
+  try {
+    for (const l of M.replayJournal(root)) console.log(l);
+    const bad = checks(root, cfg);
+    if (bad) { console.log(bad); return 73; }
+    if (expect !== null) {
+      const head = sh(`git -C ${q(root)} rev-parse HEAD`);
+      if (!head.startsWith(expect.toLowerCase())) {
+        console.log(`HEAD is ${head.slice(0, 7)}, expected ${expect.slice(0, 7)}; landed since:`);
+        const log = trySh(`git -C ${q(root)} log --oneline ${q(expect + '..HEAD')}`);
+        console.log(log.out || '(no commits between them: HEAD is not a descendant of the expected sha)');
+        const range = new Set(trySh(`git -C ${q(root)} rev-list ${q(expect + '..HEAD')}`).out.split('\n').filter(Boolean));
+        for (const rc of R.readRegistry(root).receipts || []) if (rc.candidate && range.has(rc.candidate)) console.log(`  package ${rc.id} (${rc.kind}, ${rc.owner})`);
+        return 73;
+      }
+    }
+    await R.withRegistry(root, reg => {
+      R.event(reg, kind, '-', `${label}: ${cmd}`);
+      if (kind === 'freeze') reg.freeze = { label, pid: process.pid, since: now(), cmd };
+    });
+    let code;
+    try {
+      // As land's child: the lock's holder watches the command's pid, so this process dying while
+      // a full suite or a confirmed deploy runs does not free the lock under it (D14, D15).
+      code = await new Promise(resolve => {
+        const child = spawnWatched(L, ['bash', '-lc', cmd], { cwd: root, stdio: 'inherit', env: { ...process.env, HOLDEN_LANDING_HELD: '1' } });
+        child.on('error', e => { err(e.message); resolve(1); });
+        child.on('close', c => resolve(c === null || c < 0 ? 1 : c));
+      });
+    } finally {
+      if (kind === 'freeze') await R.withRegistry(root, reg => { reg.freeze = null; R.event(reg, 'thaw', '-', `${label}: exit ${code}`); });
+    }
+    return code;
+  } finally { if (L) await L.release(); }
+}
+
+const s7 = s => String(s || '').slice(0, 7);
+const branchHead = (root, id) => { const r = trySh(`git -C ${q(root)} rev-parse --verify --quiet ${q('refs/heads/holden/' + id)}`); return r.ok ? r.out : null; };
+const show = r => process.stdout.write((r.stdout || '') + (r.stderr || ''));
+// The merge commit bin/h-worktree land writes for this head, on `ref`, whose second parent is the
+// head itself: the landing happened, whatever became of the branch (D07: recovery reads git).
+function landedMerge(root, id, submitted, ref) {
+  const g = trySh(`git -C ${q(root)} log --merges -1 --format=%H --fixed-strings --grep=${q(`merge(${id}): land holden/${id} ${s7(submitted)}`)} ${q(ref)}`);
+  if (!g.ok || !g.out) return null;
+  const p2 = trySh(`git -C ${q(root)} rev-parse ${q(g.out + '^2')}`);
+  return p2.ok && p2.out === submitted ? g.out : null;
+}
+// D07: the landing receipt outlives the branch. A recovered one carries the tests `pending` named
+// that are present in the merge commit, the same set h-worktree land would have re-run.
+// The package's own commits, base to the landed head without merges, as skills/h-quick step 9's
+// state entry quotes them.
+function commitsLine(root, base, head) {
+  const r = trySh(`git -C ${q(root)} rev-list --reverse --no-merges ${q(head)} --not ${q(base)}`);
+  return `commits: [${(r.ok ? r.out.split('\n').filter(Boolean) : []).map(c => `"${c}"`).join(', ')}]`;
+}
+
+function writeReceipt(reg, rec, { submitted, target, candidate, tests, recovered, text }) {
+  reg.receipts = reg.receipts || [];
+  reg.receipts.push({ id: rec.id, kind: rec.kind, owner: rec.owner, submitted, target, candidate, tests, time: now(), ...(recovered ? { recovered: true } : {}) });
+  Object.assign(rec, { state: 'landed', candidate, writes: [], pending: null, waits_on: null, since: now() });
+  R.event(reg, 'landed', rec.id, text);
+}
+function recoverFromGit(root, reg, rec, merge, text) {
+  const pending = rec.pending || { tests: [] };
+  const tests = pending.tests.filter(t => trySh(`git -C ${q(root)} cat-file -e ${q(`${merge}:${t}`)}`).ok);
+  writeReceipt(reg, rec, { submitted: pending.submitted, target: sh(`git -C ${q(root)} rev-parse ${q(merge + '^1')}`), candidate: merge, tests, recovered: true, text });
+}
+
+async function land() {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null, hold = flag('--reads-hold');
+  if (!id || hold === '') return usage();
+  const root = rootOf(process.cwd());
+  const rec0 = R.readRegistry(root).packages[id];
+  if (!rec0) { err(`no package ${id} in the registry`); return 1; }
+  const ledgerF = flag('--ledger') || rec0.ledger;
+  // D07: the child runs under this process's landing lock, and the lock's holder watches its pid
+  // (lib/registry.js tryLock), so this process dying mid-landing does not free the lock under it.
+  let L = null;
+  const wtLand = (ledger, head, extra = [], env = { HOLDEN_LANDING_HELD: '1' }) => new Promise(resolve => {
+    const child = spawnWatched(env.HOLDEN_LANDING_HELD === '1' ? L : null, [process.execPath, H, 'land', id, '--ledger', ledger, '--head', head, ...extra], { cwd: root, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = { status: null, stdout: '', stderr: '' };
+    child.stdout.on('data', d => { out.stdout += d; });
+    child.stderr.on('data', d => { out.stderr += d; });
+    child.on('error', e => { out.stderr += e.message + '\n'; });
+    child.on('close', code => { out.status = code; resolve(out); });
+  });
+  if (rec0.state === 'landed') {
+    console.log(`already landed as ${s7(rec0.candidate)}`);
+    // Only the cleanup is left: h-worktree land's already-landed path, which takes the lock itself.
+    const rc = (R.readRegistry(root).receipts || []).filter(r => r.id === id).pop();
+    if (rc && ledgerF && fs.existsSync(ledgerF)) show(await wtLand(ledgerF, rc.submitted, [], {}));
+    return 0;
+  }
+  if (rec0.state === 'parked') { err(`${id} is parked; admit it again`); return 1; }
+  if (!ledgerF || !fs.existsSync(ledgerF)) { err('land needs --ledger <file>'); return 2; }
+  const ledger = path.resolve(ledgerF);
+  // As `lock` and `freeze`: a land already inside the landing lock does not wait on itself.
+  const held = process.env.HOLDEN_LANDING_HELD === '1';
+  L = held ? null : await R.holdLock(R.paths(root).landingLock, R.WAIT_MAX_S, 'land ' + id);
+  if (!held && !L) { err('the landing lock stayed busy for 4 hours; land again'); return 75; }
+  try { for (const l of M.replayJournal(root)) console.log(l); return await landLocked(root, id, ledger, hold, wtLand); } finally { if (L) await L.release(); }
+}
+
+async function landLocked(root, id, ledger, hold, wtLand) {
+  const T = sh(`git -C ${q(root)} rev-parse HEAD`), bh = branchHead(root, id);
+  // Recovery first: a landing interrupted at any boundary is finished from git and the registry,
+  // never re-run. `pending` is written before the merge and needs no branch, which h-worktree
+  // land's cleanup deletes (bin/h-worktree land, after the `Landed:` line).
+  const rv = await R.withRegistry(root, reg => {
+    const rec = reg.packages[id];
+    const rc = (reg.receipts || []).find(r => r.id === id && (!bh || r.submitted === bh));
+    if (rc) { Object.assign(rec, { state: 'landed', candidate: rc.candidate, writes: [], pending: null }); return { done: rc.submitted, text: `already landed as ${s7(rc.candidate)}` }; }
+    if (rec.pending) {
+      const m = landedMerge(root, id, rec.pending.submitted, T);
+      if (m) { const sub = rec.pending.submitted; recoverFromGit(root, reg, rec, m, 'recovered from git after a crash'); return { done: sub, text: `landed ${id} as ${s7(m)} (recovered from git after a crash)` }; }
+      rec.pending = null;
+    }
+    if (!bh) return { refuse: `no branch and no receipt for ${id}` };
+    return {};
+  });
+  if (rv.refuse) { err(rv.refuse); return 1; }
+  if (rv.done) { console.log(rv.text); show(await wtLand(ledger, rv.done)); return 0; }
+
+  // D10: every path of the diff outside the reservation goes through extend's rank rule. --no-renames:
+  // a rename is a deletion of one path and a write of another, and both are writes.
+  const submitted = bh;
+  const base = R.readRegistry(root).packages[id].base;
+  const diff = sh(`git -C ${q(root)} diff --name-only --no-renames ${q(base)} ${q(submitted)}`).split('\n').filter(Boolean).map(norm);
+  const shared = sharedIn(diff); if (shared.length) { err(sharedRefusal(shared)); return 1; }
+  const ext = await R.withRegistry(root, async reg => {
+    const rec = reg.packages[id];
+    rec.heartbeat = now();
+    const undeclared = diff.filter(p => !(rec.writes || []).includes(p));
+    const x = await extendPaths(root, reg, rec, undeclared);
+    if (x.code === 0 && undeclared.length) R.event(reg, 'extended', id, `at landing: granted ${undeclared.join(', ')}; writes ${rec.writes.join(', ')}`);
+    const why = x.code ? (reg.events || []).filter(e => e.id === id).pop() : null;
+    return { ...x, why: why ? `${why.kind} ${why.text}` : null, rec: JSON.parse(JSON.stringify(rec)) };
+  });
+  if (ext.code === 1) { for (const l of ext.lines) console.log(l); return 1; }
+  if (ext.code === 70 || ext.code === 71) {
+    for (const l of ext.lines.filter(l => !l.startsWith('granted '))) console.log(ext.code === 70 ? `${l}, then land again` : l);
+    if (ext.why) console.log(`${id}: ${ext.why}`);
+    return ext.code;
+  }
+  const rec = ext.rec;
+
+  // D10: a declared read changed on the main branch since the base, or since the range the last
+  // ruling covered, stops the landing until the gate reviewer rules on that diff.
+  if ((rec.reads || []).length) {
+    const upto = rec.reads_ruling ? rec.reads_ruling.upto : rec.base;
+    const changed = sh(`git -C ${q(root)} diff --name-only --no-renames ${q(upto)} ${q(T)} -- ${rec.reads.map(q).join(' ')}`).split('\n').filter(Boolean);
+    if (changed.length) {
+      if (hold === null) {
+        console.log(`changed reads: ${changed.join(', ')}`);
+        console.log(`range: ${upto}..${T}`);
+        console.log(`the gate reviewer rules on that diff; land again with --reads-hold <ruling> when it holds, or yield`);
+        return 76;
+      }
+      await R.withRegistry(root, reg => {
+        reg.packages[id].reads_ruling = { text: hold, upto: T, files: changed, time: now() };
+        R.event(reg, 'reads-hold', id, `${changed.join(', ')} in ${s7(upto)}..${s7(T)}: ${hold}`);
+      });
+      fs.appendFileSync(ledger, `Reads ruling: ${hold} (range ${s7(upto)}..${s7(T)}: ${changed.join(', ')})\n`);
+    }
+  }
+
+  // D08: the proved tests of every package that landed since this one's base run with its own.
+  const also = R.receiptsSince(R.readRegistry(root), root, rec.base, T).tests;
+  await R.withRegistry(root, reg => { reg.packages[id].pending = { submitted, target: T, tests: uniq([...R.ledgerTests(ledger), ...also]), time: now() }; });
+  R.crashAt('queue-before-land');
+  const r = await wtLand(ledger, submitted, also.length ? ['--also-tests', ...also] : []);
+  show(r);
+  if (r.status === 0) {
+    const M = sh(`git -C ${q(root)} rev-parse HEAD`);
+    const tl = (r.stdout || '').split('\n').find(l => l.startsWith('landed-tests: '));
+    let tests = []; try { tests = tl ? JSON.parse(tl.slice('landed-tests: '.length)) : []; } catch (e) {}
+    R.crashAt('queue-after-land');
+    await R.withRegistry(root, reg => writeReceipt(reg, reg.packages[id], { submitted, target: T, candidate: M, tests, text: `${s7(submitted)} as ${s7(M)} on ${s7(T)}; re-ran ${tests.length}` }));
+    console.log(`landed ${id} as ${s7(M)}`);
+    console.log(commitsLine(root, rec.base, submitted));
+    return 0;
+  }
+  // A non-zero exit can come after the fast-forward (h-worktree died writing its ledger line): the
+  // main branch, not the exit code, says whether the package landed.
+  const code = r.status === null ? 1 : r.status;
+  const m = await R.withRegistry(root, reg => {
+    const rec = reg.packages[id];
+    const merge = landedMerge(root, id, submitted, 'HEAD');
+    if (merge) { recoverFromGit(root, reg, rec, merge, `recovered from git after h-worktree exited ${code}`); return merge; }
+    rec.pending = null;
+    return null;
+  });
+  if (!m) return code;
+  console.log(`landed ${id} as ${s7(m)} (recovered from git after h-worktree exited ${code})`);
+  console.log(commitsLine(root, rec.base, submitted));
+  show(await wtLand(ledger, submitted));
+  return 0;
+}
+
+// D05 and D04: yield and drop are one act, drop the branch with its uncommitted work kept as a
+// checked patch, release the reservations, park; only the counter differs. With `reg` the caller
+// holds the registry lock (conflictsResolved yielding a stale holder): the drop runs inside it and
+// the park is written to that registry. Returns { code, lines, p }: lines are what to print.
+async function parkPackage(root, id, reason, counter, { reg = null, ledger: ledgerF = null } = {}) {
+  const verb = counter === 'yields' ? 'yield' : 'drop', lines = [];
+  const rec0 = reg ? reg.packages[id] : R.readRegistry(root).packages[id];
+  if (!rec0) return { code: 1, lines: [`h-queue: no package ${id} in the registry`] };
+  if (rec0.state === 'parked') return { code: 0, lines: [`${id} already parked`], p: rec0 };
+  if (rec0.state !== 'admitted' && rec0.state !== 'waiting') return { code: 1, lines: [`h-queue: ${id} is ${rec0.state}; there is nothing to ${verb}`] };
+  // A package with no ledger path still gets one, outside the repo beside the registry, so the
+  // head line and the patch have a place.
+  const ledger = path.resolve(ledgerF || rec0.ledger || path.join(path.dirname(R.paths(root).registry), 'holden-ledgers', `${id}-LEDGER.md`));
+  // A ledger holding a `Dropped:` line of this package is a drop killed before it moved the ledger:
+  // bin/h-worktree drop finishes it from that line, branch or no branch.
+  const unfinished = fs.existsSync(ledger) && fs.readFileSync(ledger, 'utf8').split('\n').some(l => l.startsWith(`Dropped: holden/${id} at `));
+  // undefined: no drop ran, and park keeps the record's head and patch (lib/registry.js park).
+  let head = branchHead(root, id) || undefined, patch;
+  if (head || unfinished) {
+    // bin/h-worktree drop refuses a missing --ledger file.
+    if (!fs.existsSync(ledger)) { fs.mkdirSync(path.dirname(ledger), { recursive: true }); fs.writeFileSync(ledger, `# Executor ledger: ${id}\nPlan: ${rec0.plan || 'none'}\n`); }
+    const env = reg ? { ...process.env, HOLDEN_REGISTRY_HELD: '1' } : process.env;
+    const r = cp.spawnSync(process.execPath, [H, 'drop', id, '--ledger', ledger, '--reason', reason, '--save-patch'], { cwd: root, encoding: 'utf8', env });
+    const out = ((r.stdout || '') + (r.stderr || '')).trim();
+    if (out) lines.push(out);
+    if (r.status !== 0) { lines.push(`h-queue: ${id} not parked: h-worktree drop failed`); return { code: 1, lines }; }
+    const m = (r.stdout || '').match(/uncommitted work saved in (.+)$/m), h = (r.stdout || '').match(/^dropped-head: (\S+)$/m);
+    patch = m ? m[1].trim() : null;
+    if (h) head = h[1];
+  }
+  const parkIn = g => {
+    const x = g.packages[id];
+    if (!x) return { other: 'gone from the registry' };
+    if (x.state !== 'admitted' && x.state !== 'waiting') return { other: x.state };
+    // `h-queue yield` and `drop` are the package's own commands; a stale holder's park is not.
+    if (!reg) x.heartbeat = now();
+    return { ...R.park(g, id, { reason, head, patch, counter }) };
+  };
+  const p = reg ? parkIn(reg) : await R.withRegistry(root, parkIn);
+  if (p.other) { lines.push(`h-queue: ${id} was dropped but not parked: it is ${p.other}`); return { code: 1, lines }; }
+  lines.push(`parked ${id} at ${p.head ? s7(p.head) : 'no branch'}; patch ${p.patch || 'none'}; yields ${p.yields || 0} drops ${p.drops || 0}`);
+  return { code: 0, lines, p };
+}
+
+async function parkCmd(counter) {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null, reason = flag('--reason');
+  if (!id || !reason) return usage();
+  const r = await parkPackage(rootOf(process.cwd()), id, reason, counter, { ledger: flag('--ledger') });
+  for (const l of r.lines) (l.startsWith('h-queue: ') ? console.error : console.log)(l);
+  return r.code;
+}
+
+// D04 and D11: poll until a parked package can be admitted again or a waiting one is granted its
+// path. Every poll locks the registry, decides and unlocks (D01); a stale holder is yielded by
+// conflictsResolved there, so a wait on a dead session ends after the holder's 60 silent minutes.
+// After WAIT_MAX_S since the package began to wait or was parked, 74: the orchestrator asks the
+// operator (D04), and the record stays as it is.
+async function wait() {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null, pollF = flag('--poll');
+  if (!id || (pollF !== null && !(Number(pollF) > 0))) return usage();
+  const root = rootOf(process.cwd());
+  const POLL_S = pollF !== null ? Number(pollF) : 15;
+  // Test-only: tests/h-queue-stale.test.js cannot wait four hours, or a minute for the beat line.
+  const maxS = Number(process.env.HOLDEN_TEST_WAIT_MAX_S) || R.WAIT_MAX_S, beatS = Number(process.env.HOLDEN_TEST_WAIT_BEAT_S) || 60;
+  let nextBeat = Date.now() + beatS * 1000;
+  for (;;) {
+    const res = await R.withRegistry(root, async reg => {
+      const rec = reg.packages[id];
+      if (!rec) return { refuse: `no package ${id} in the registry` };
+      // admit reserves (admitted, no worktree) before h-worktree add and writes the worktree after:
+      // until then the admission is in flight, and a crashed one is finished by the next admit.
+      if (rec.state === 'admitted' && rec.worktree) return { admitted: rec.worktree };
+      if (rec.state === 'admitted') {
+        const el = Math.round((Date.now() - Date.parse(rec.since)) / 1000);
+        if (el > maxS) {
+          R.event(reg, 'gave-up', id, `admitted ${el}s with no worktree`);
+          return { gaveUp: `${id} waited 4 hours for its worktree; ask the operator (h-queue admit ${id} finishes a crashed admission)` };
+        }
+        return { blocked: `${id} admitted, worktree not made yet (h-queue admit ${id} finishes a crashed admission), ${el}s of ${maxS}` };
+      }
+      if (rec.state !== 'parked' && rec.state !== 'waiting') return { refuse: `${id} is ${rec.state}; there is nothing to wait for` };
+      // wait is one of the package's own commands (D11): a waiting package whose wait runs is alive.
+      rec.heartbeat = now();
+      // A parked package holds nothing (D05): its stored declaration is checked, reserved only by admit.
+      const ps = rec.state === 'parked' ? (rec.declared || []) : (rec.waits_on ? [rec.waits_on.path] : []);
+      const cr = await conflictsResolved(root, reg, rec, ps);
+      if (cr.failed) return { refuse: `${id}: the stale holder could not be yielded`, lines: cr.lines };
+      if (!cr.conflicts.length) {
+        if (rec.state === 'parked') return { readmit: true, lines: cr.lines };
+        for (const p of ps) { rec.writes = uniq([...(rec.writes || []), p]); rec.declared = uniq([...(rec.declared || []), p]); if (aloneFile(p)) rec.alone = p; }
+        Object.assign(rec, { state: 'admitted', waits_on: null, since: now() });
+        R.event(reg, 'granted', id, ps.join(', ') || '-');
+        return { granted: ps, lines: cr.lines };
+      }
+      const top = R.verdict(rec, cr.conflicts), el = Math.round((Date.now() - Date.parse(rec.since)) / 1000);
+      if (el > maxS) {
+        R.event(reg, 'gave-up', id, `${rec.state} ${el}s on ${top.holder.id} for ${top.path}`);
+        return { gaveUp: `${id} waited 4 hours on ${top.holder.id} for ${top.path}; ask the operator (h-queue status shows both)`, lines: cr.lines };
+      }
+      return { blocked: `${id} ${rec.state} on ${top.holder.id} for ${top.path}, ${el}s of ${maxS}`, lines: cr.lines };
+    });
+    for (const l of res.lines || []) console.log(l);
+    if (res.refuse) { err(res.refuse); return 1; }
+    if (res.admitted !== undefined) { console.log(res.admitted); return 0; }
+    if (res.granted) { for (const p of res.granted) console.log(`granted ${p}`); return 0; }
+    if (res.gaveUp) { err(res.gaveUp); return 74; }
+    if (res.readmit) {
+      // Outside the registry lock: admit takes the landing lock first, then the registry (D07), and
+      // checks again under both. 70 means another package took the path in between: keep waiting.
+      const code = await admit();
+      if (code !== 70) return code;
+    } else if (Date.now() >= nextBeat) { console.log(`h-queue: ${res.blocked}`); nextBeat = Date.now() + beatS * 1000; }
+    await R.sleep(POLL_S * 1000);
+  }
+}
+
+// D11: "my thing crashed, resume" re-admits through D05: a package still admitted or waiting under
+// a dead session is yielded first (head and patch recorded beside its ledger), then admitted again
+// from this session, which admit records as the driver with its transcript.
+async function resume() {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null;
+  if (!id) return usage();
+  const root = rootOf(process.cwd());
+  const rec = R.readRegistry(root).packages[id];
+  if (!rec) { err(`no package ${id} in the registry`); return 1; }
+  if (rec.state === 'admitted' || rec.state === 'waiting') {
+    const r = await parkPackage(root, id, 'resume: re-admitted from session ' + (process.env.CLAUDE_CODE_SESSION_ID || 'none'), 'yields');
+    for (const l of r.lines) (l.startsWith('h-queue: ') ? console.error : console.log)(l);
+    if (r.code !== 0) return r.code;
+  }
+  const p = R.readRegistry(root).packages[id];
+  return admit([`recorded: head ${p.head ? s7(p.head) : 'none'}, patch ${p.patch || 'none'}`]);
+}
+
+// Quick 261025 D01-D03: forget a parked package that will never run. One registry write deletes
+// the record. Nothing on disk is touched (phase 001 D11): the patch and the ledgers that stay are
+// printed and logged. A parked package holds no paths (lib/registry.js park), so the registry lock
+// alone orders it, and a live `h-queue wait` on the id exits 1 `no package` on its next poll.
+// A phase's parked record is what stops the phase closing with a plan unlanded (bin/h-worktree check).
+async function retire() {
+  const id = args[1] && !args[1].startsWith('--') ? args[1] : null, reason = flag('--reason');
+  if (!id || !reason) return usage();
+  const root = rootOf(process.cwd());
+  const res = await R.withRegistry(root, reg => {
+    const ps = reg.packages || {}, rec = Object.prototype.hasOwnProperty.call(ps, id) ? ps[id] : null;
+    if (!rec) return { refuse: `no package ${id} in the registry` };
+    const live = rec.state === 'admitted' || rec.state === 'waiting';
+    // A landing in doubt first, whatever the state: land finishes an in-flight one from git and
+    // refuses a parked one (lib/registry.js isStale's comment), so a retire would strand landed work.
+    if (rec.pending) return { refuse: live ? `${id} has a landing in doubt; h-queue land ${id} finishes it` : `${id} has a landing in doubt; ask the operator` };
+    if (live) return { refuse: `${id} is ${rec.state}; yield or drop it first` };
+    if (rec.state !== 'parked') return { refuse: `${id} is ${rec.state}; only a parked package can be retired` };
+    const phase = String(rec.owner || '').match(/^phase:(.+)$/);
+    if (phase) return { refuse: `${id} belongs to phase ${phase[1]}; /h-execute re-runs a phase's parked package` };
+    const { head, patch } = rec, ledgers = keptLedgers(root, id, rec);
+    const kept = `patch ${patch || 'none'}, ledgers ${ledgers.length ? ledgers.join(', ') : 'none'}`;
+    delete ps[id];
+    R.event(reg, 'retired', id, `${reason}; head ${head ? s7(head) : 'none'}, ${kept}`);
+    return { kept };
+  });
+  if (res.refuse) { err(res.refuse); return 1; }
+  console.log(`retired ${id}`);
+  console.log(`kept: ${res.kept}`);
+  return 0;
+}
+// D03: the ledgers a retire leaves. bin/h-worktree drop renames the ledger to <stem>-dropped-r<n>.md
+// and park never updates `ledger`, so the record's own path is listed only while it exists. With no
+// ledger on the record, the path is parkPackage's default beside the registry.
+function keptLedgers(root, id, rec) {
+  const L = path.resolve(rec.ledger || path.join(path.dirname(R.paths(root).registry), 'holden-ledgers', `${id}-LEDGER.md`));
+  const stem = L.replace(/\.md$/, ''), dir = path.dirname(stem);
+  const re = new RegExp(`^${path.basename(stem).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-dropped-r(\\d+)\\.md$`);
+  let names = []; try { names = fs.readdirSync(dir); } catch (e) {}
+  const dropped = names.map(n => n.match(re)).filter(Boolean).sort((a, b) => Number(a[1]) - Number(b[1])).map(m => path.join(dir, m[0]));
+  return [...(fs.existsSync(L) ? [L] : []), ...dropped];
+}
+
+// D01 (phase 002): a metadata transaction. open copies shared files from HEAD into a private
+// token; commit (under the landing lock) merges them onto HEAD and publishes; abort deletes one.
+async function meta() {
+  const sub = args[1];
+  if (sub === 'open') return metaOpen();
+  if (sub === 'abort') return metaAbort();
+  if (sub === 'commit') return metaCommit();
+  return usage();
+}
+
+// Takes no lock and blocks nothing (D01). The copies come from `git cat-file blob` as a buffer,
+// never from atHead, which trims the trailing newline.
+function metaOpen() {
+  // Phase 004 D05: --stamps opens any file tracked at HEAD. The orchestrator then writes a doc's stamp on a
+  // private copy merged against HEAD, so no stamp edit waits in the main checkout for the next landing's
+  // fast-forward (bin/h-worktree land refuses one over uncommitted changes, exit 6).
+  const stamps = args.includes('--stamps');
+  const files = uniq(args.slice(2).filter(a => a !== '--stamps').map(norm));
+  if (!files.length || files.some(f => f.startsWith('-'))) return usage();
+  const root = rootOf(process.cwd());
+  if (stamps) {
+    // A symlink is a blob too; its mode tells it apart, and a stamp commit would replace the link with a file.
+    const blob = f => { const r = trySh(`git -C ${q(root)} ls-tree HEAD -- ${q(f)}`); return r.ok && /^100(644|755) blob /.test(r.out) && r.out.endsWith('\t' + f); };
+    const bad = files.filter(f => badRepoPath(f) || !blob(f));
+    if (bad.length) { err(`not a file tracked at HEAD: ${bad.join(', ')}; --stamps opens an existing doc to stamp`); return 1; }
+  } else {
+    const bad = files.filter(f => !SHARED.includes(f));
+    if (bad.length) { err(`not a shared file: ${bad.join(', ')}; an owner-unique path goes to meta commit --add`); return 1; }
+  }
+  const head = sh(`git -C ${q(root)} rev-parse HEAD`);
+  const token = `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`, d = M.tokenDir(root, token);
+  fs.mkdirSync(path.join(d, 'new'), { recursive: true });
+  const absent = [];
+  for (const f of files) {
+    const b = cp.spawnSync('git', ['-C', root, 'cat-file', 'blob', `HEAD:${f}`], { maxBuffer: 1 << 28 });
+    if (b.status !== 0) { absent.push(f); continue; }
+    M.writeAtomic(path.join(d, 'base', f), b.stdout); M.writeAtomic(path.join(d, 'work', f), b.stdout);
+  }
+  M.writeAtomic(path.join(d, 'token.json'), JSON.stringify({ token, head, files, absent, stamps, opened: now(), session: process.env.CLAUDE_CODE_SESSION_ID || null }, null, 2) + '\n');
+  console.log(`token ${token}`);
+  for (const f of files) console.log(`work ${f} ${path.join(d, 'work', f)}${absent.includes(f) ? ' (absent at HEAD)' : ''}`);
+  console.log(`new ${path.join(d, 'new')}`);
+  return 0;
+}
+
+// D03: the shared files whose tree or main index differs from HEAD, and a --stamps token's own docs
+// (phase 004 D05). Step 5 writes HEAD's blobs over the tree, so a change found here would be lost;
+// every SHARED path counts, in the token or not.
+function sharedDirty(root, paths = SHARED) {
+  const ok = argv => cp.spawnSync('git', ['-C', root, ...argv], { stdio: 'ignore' }).status === 0;
+  return paths.filter(p => {
+    const staged = !ok(['diff', '--cached', '--quiet', 'HEAD', '--', p]);
+    if (ok(['cat-file', '-e', `HEAD:${p}`])) return staged || !ok(['diff', '--quiet', 'HEAD', '--', p]);
+    let inTree = false; try { fs.lstatSync(path.join(root, p)); inTree = true; } catch (e) {}
+    return staged || inTree;
+  });
+}
+
+// A path a token may stage or delete: inside the repo, not the git dir, and no shared file in it,
+// since a shared file goes through meta open's merge, never straight from the tree.
+// A repo-relative path that names nothing outside the repo and nothing in the git dir.
+const badRepoPath = p => !p || p === '.' || path.isAbsolute(p) || p.split('/').includes('..') || p === '.git' || p.startsWith('.git/');
+function pathRule(p, label) {
+  if (badRepoPath(p)) return `${label} ${p}: not a repo path`;
+  if (SHARED.includes(p) || SHARED.some(s => s.startsWith(p + '/'))) return `${label} ${p} is or holds a shared file: open it with meta open`;
+  return null;
+}
+
+// D01 step 3, on the merged files: lines with code 1 (the token is wrong: fix it) or 73 (HEAD or
+// another session got there first: open again). The --next-* checks read HEAD under the lock for
+// "taken", and the merged state for "this commit claims it once" (contradiction 6).
+function metaChecks(root, cfg, d, tk, adds, removes) {
+  const out = [], bad = (code, line) => out.push({ code, line });
+  const inTok = f => tk.files.includes(f);
+  const atHeadBuf = f => { const r = cp.spawnSync('git', ['-C', root, 'cat-file', 'blob', `HEAD:${f}`], { maxBuffer: 1 << 28 }); return r.status === 0 ? r.stdout.toString('utf8') : ''; };
+  const text = f => { const m = path.join(d, 'merged', f); return inTok(f) && fs.existsSync(m) ? fs.readFileSync(m, 'utf8') : atHeadBuf(f); };
+  const atHeadExists = p => cp.spawnSync('git', ['-C', root, 'cat-file', '-e', `HEAD:${p}`], { stdio: 'ignore' }).status === 0;
+  const inTree = p => { try { fs.lstatSync(path.join(root, p)); return true; } catch (e) { return false; } };
+  const ASKS = '.planning/asks.yaml';
+  const parsed = {};
+  for (const f of [ST_FILE, ASKS]) {
+    if (!inTok(f) || !fs.existsSync(path.join(d, 'merged', f))) continue;
+    try { parsed[f] = yaml.parse(text(f)) || {}; }
+    catch (e) { bad(73, `${f} does not parse after the merge (${e.message}): open again and redo the edit`); }
+  }
+  // Keyed by the dir's basename, else the id: a GSD-converted state.yaml repeats ids across
+  // distinct dirs, so the id alone would refuse every commit there.
+  const quickKey = e => e && e.dir ? path.basename(String(e.dir)) : String(e && e.id);
+  const counts = xs => xs.reduce((m, x) => m.set(x, (m.get(x) || 0) + 1), new Map());
+  // A token without state.yaml claims no entry: its counts are 0.
+  const st = inTok(ST_FILE) ? parsed[ST_FILE] || null : null;
+  const phasesOf = s => (s && Array.isArray(s.phases) ? s.phases : []).filter(Boolean);
+  const quicksOf = s => (s && Array.isArray(s.quick) ? s.quick : []).filter(Boolean);
+  if (st) {
+    // Every entry with a number takes part (quick 261019 D01); only a null number is skipped.
+    for (const [n, k] of counts(phasesOf(st).filter(p => p.number != null).map(p => phaseKey(p.number)))) if (k > 1) bad(73, `phase number ${n} appears ${k} times in .planning/state.yaml; one entry expected`);
+    for (const [key, k] of counts(quicksOf(st).map(quickKey))) if (k > 1) bad(73, `quick ${key} appears ${k} times in .planning/state.yaml; one entry expected`);
+  }
+  if (parsed[ASKS]) {
+    const asks = Array.isArray(parsed[ASKS].asks) ? parsed[ASKS].asks.filter(Boolean) : [];
+    for (const [id, k] of counts(asks.filter(a => a.id != null).map(a => String(a.id)))) if (k > 1) bad(73, `ask ${id} appears ${k} times in asks.yaml; one entry expected`);
+  }
+  const np = flag('--next-phase'), nq = flag('--next-quick'), ask = flag('--ask-once');
+  if (np !== null) {
+    const expected = nextPhase(root, cfg);
+    if (String(np).padStart(3, '0') !== expected) bad(73, `next phase is ${expected}, not ${np}`);
+    else {
+      const k = phasesOf(st).filter(p => phaseKey(p.number) === phaseKey(np)).length;
+      if (k !== 1) bad(73, `phase ${np} appears ${k} times in the merged .planning/state.yaml; one entry expected`);
+    }
+  }
+  if (nq !== null) {
+    const dir = (cfg.paths || {}).quick || '.planning/quick';
+    const inHeadState = (headState(root).quick || []).some(e => e && (String(e.id) === nq || path.basename(String(e.dir || '')) === nq));
+    if (atHeadExists(`${dir}/${nq}`) || inHeadState) bad(73, `quick ${nq} already exists at HEAD`);
+    else {
+      const k = quicksOf(st).filter(e => quickKey(e) === nq).length;
+      if (k !== 1) {
+        // quick 261021 D02: an entry whose id is the value is keyed by its dir, so name the dir to
+        // pass. yaml-lite reads `id: 064` as 64, so an all-digit value is compared without its
+        // leading zeros too.
+        const bare = /^\d+$/.test(nq) ? nq.replace(/^0+(?=\d)/, '') : null;
+        const byId = k === 0 ? quicksOf(st).find(e => e.dir && (String(e.id) === nq || (bare !== null && String(e.id) === bare))) : null;
+        bad(73, `quick ${nq} appears ${k} times in the merged .planning/state.yaml; one entry expected` +
+          (byId ? `; a quick is keyed by its directory's name: pass --next-quick ${path.basename(String(byId.dir))}` : ''));
+      }
+    }
+  }
+  if (ask !== null) {
+    const re = new RegExp(`^\\s*-\\s+id:\\s*["']?${ask.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']?\\s*(#.*)?$`);
+    const n = text(ASKS).split('\n').filter(l => re.test(l)).length;
+    if (n !== 1) bad(73, `ask ${ask} appears ${n} times in asks.yaml; one entry expected`);
+  }
+  const nw = walkNew(path.join(d, 'new'));
+  for (const rel of [...nw.files, ...nw.emptyDirs]) {
+    const st2 = fs.lstatSync(path.join(d, 'new', rel));
+    if (SHARED.includes(rel)) bad(1, `${rel} is a shared file: open it with meta open, not under new/`);
+    else if (!st2.isFile() && !st2.isDirectory()) bad(1, `${rel} under new/ is not a regular file`);
+    else if (atHeadExists(rel)) bad(73, `${rel} already exists at HEAD`);
+    else if (inTree(rel)) bad(73, `${rel} already exists in the tree`);
+  }
+  for (const p of adds) {
+    const r = pathRule(p, '--add');
+    if (r) bad(1, r);
+    else if (!inTree(p) && !atHeadExists(p)) bad(1, `--add ${p}: no such path in the tree or at HEAD`);
+  }
+  for (const p of removes) {
+    const r = pathRule(p, 'remove');
+    if (r) bad(1, r);
+    else if (!atHeadExists(p)) bad(1, `remove ${p}: not at HEAD`);
+    // A removed directory is synced away whole: a file in it no transaction made would go with it.
+    else if (trySh(`git --no-optional-locks -C ${q(root)} status --porcelain --untracked-files=all -- ${q(p)}`).out) bad(73, `uncommitted change in ${p}: commit or discard it`);
+    else {
+      // bin/h-milestone-close copies a removed dir under new/ from the HEAD it ran at; a commit to
+      // the dir since the open would be deleted here and missing from the copy. A token without a
+      // readable head cannot show otherwise, so it is refused too.
+      const since = trySh(`git -C ${q(root)} diff --name-only ${q(String(tk.head || ''))} HEAD -- ${q(p)}`);
+      if (!since.ok || since.out) bad(73, `${p} changed at HEAD since the token opened: open again`);
+    }
+  }
+  // bin/h-milestone-close rewrote the pointers in the token's copies only; the merge can bring in
+  // another session's line naming a removed dir, which this commit would publish dangling. A shared
+  // file the token does not hold can gain one at HEAD the same way, so every SHARED file is read.
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const p of removes.map(r => r.replace(/\/+$/, '')).filter(Boolean)) {
+    const re = new RegExp(`(?<![A-Za-z0-9_./-])${esc(p)}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9_-])`);
+    for (const f of SHARED) if (re.test(text(f))) bad(73, `${f} names ${p}, which this commit removes: open again and redo the edit`);
+  }
+  return out;
+}
+
+// D01's commit, steps 1-5, under the landing lock. HOLDEN_LANDING_HELD marks a run inside
+// `h-queue lock --`, which already holds it (underLanding's rule).
+async function metaCommit() {
+  const token = args[2] && !args[2].startsWith('-') ? args[2] : null, msg = flag('-m');
+  if (!token || !msg) return usage();
+  const adds = list('--add').map(p => norm(p).replace(/\/+$/, ''));
+  const checked = flag('--checked');
+  if (checked !== null && (!checked || checked.startsWith('-'))) return usage();
+  const root = rootOf(process.cwd());
+  let L = null;
+  if (process.env.HOLDEN_LANDING_HELD !== '1') {
+    L = await R.holdLock(R.paths(root).landingLock, R.WAIT_MAX_S, flag('--label') || 'meta commit');
+    if (!L) { err('the landing lock stayed busy for 4 hours; ask the operator'); return 75; }
+  }
+  try { return metaCommitLocked(root, token, msg, adds, checked); } finally { if (L) await L.release(); }
+}
+
+// Each file and each directory with no file under `dir`, as repo paths relative to it.
+function walkNew(dir, rel = '', out = { files: [], emptyDirs: [] }) {
+  let names = []; try { names = fs.readdirSync(path.join(dir, rel)); } catch (e) { return out; }
+  if (rel && !names.length) out.emptyDirs.push(rel);
+  for (const n of names) {
+    const r = rel ? `${rel}/${n}` : n, st = fs.lstatSync(path.join(dir, r));
+    if (st.isDirectory()) walkNew(dir, r, out); else out.files.push(r);
+  }
+  return out;
+}
+
+function metaCommitLocked(root, token, msg, adds, checked) {
+  // Step 1 first: an interrupted sync of an earlier publish would otherwise read as a stale tree.
+  for (const l of M.replayJournal(root)) console.log(l);
+  const d = M.tokenDir(root, token);
+  if (!d || !fs.existsSync(path.join(d, 'token.json'))) { err('no such token: open again'); return 1; }
+  let tk;
+  try {
+    tk = JSON.parse(fs.readFileSync(path.join(d, 'token.json'), 'utf8'));
+    // A file outside SHARED is merged and written only for a --stamps token, and only inside the repo;
+    // anything else is a hand edit.
+    if (!tk || !Array.isArray(tk.files) || !tk.files.every(f => SHARED.includes(f) || (tk.stamps === true && typeof f === 'string' && !badRepoPath(f)))) throw new Error('shape');
+  } catch (e) { err(`token ${token} is unreadable: h-queue meta abort ${token}, then open again`); return 1; }
+  const dirty = sharedDirty(root, tk.stamps === true ? uniq([...SHARED, ...tk.files]) : SHARED);
+  if (dirty.length) { for (const p of dirty) console.log(`uncommitted change in ${p}: commit or discard it`); return 73; }
+  const old = sh(`git -C ${q(root)} rev-parse HEAD`);
+  // --checked: the orchestrator re-checked the docs at <sha>; a commit since then that touches one is a redo, decided under the lock.
+  if (checked) {
+    const since = trySh(`git -C ${q(root)} log --format=%h ${q(checked)}..HEAD -- ${tk.files.map(q).join(' ')}`);
+    if (!since.ok) { err(`--checked ${checked} is not a commit: h-queue meta abort ${token}`); return 1; }
+    if (since.out.trim()) { console.log(`changed since ${checked}: ${tk.files.join(' ')}: abort, re-check and open again`); return 73; }
+  }
+
+  // Step 2: ours = work, base = base, theirs = HEAD. A conflict is a redo, never a union (D02).
+  const changed = [], conflicts = [];
+  for (const f of tk.files) {
+    const work = path.join(d, 'work', f), base = path.join(d, 'base', f);
+    const hasWork = fs.existsSync(work), hasBase = fs.existsSync(base);
+    if (!hasWork && !hasBase) continue;
+    if (!hasWork) { err(`the work copy of ${f} is missing: h-queue meta abort ${token}, then open again`); return 1; }
+    const b = cp.spawnSync('git', ['-C', root, 'cat-file', 'blob', `HEAD:${f}`], { maxBuffer: 1 << 28 });
+    const theirs = b.status === 0 ? b.stdout : Buffer.alloc(0), theirsF = path.join(d, 'theirs', f);
+    M.writeAtomic(theirsF, theirs);
+    let baseF = base;
+    if (!hasBase) { baseF = path.join(d, 'empty'); M.writeAtomic(baseF, ''); }
+    const r = cp.spawnSync('git', ['-C', root, 'merge-file', '-p', '-L', 'work', '-L', 'base', '-L', 'HEAD', work, baseF, theirsF], { maxBuffer: 1 << 28 });
+    if (r.status === 0) { M.writeAtomic(path.join(d, 'merged', f), r.stdout); if (!r.stdout.equals(theirs)) changed.push(f); }
+    // git's exit is the conflict count, capped at 127.
+    else if (r.status >= 1 && r.status <= 127) conflicts.push(f);
+    else { err(`git merge-file failed on ${f}: ${String(r.stderr || '').trim()}`); return 1; }
+  }
+  if (conflicts.length) { for (const f of conflicts) console.log(`conflict in ${f}: open again and redo the edit`); return 73; }
+  let removes = [];
+  try { removes = fs.readFileSync(path.join(d, 'remove'), 'utf8').split('\n').map(l => l.trim()).filter(Boolean).map(norm); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const failed = metaChecks(root, config(root), d, tk, adds, removes);
+  if (failed.length) { for (const f of failed) console.log(f.line); return failed.some(f => f.code === 1) ? 1 : 73; }
+
+  // Step 4, in the token's own index: the main index is never used for metadata (D01).
+  const env = { ...process.env, GIT_INDEX_FILE: path.join(d, 'index') };
+  const g = (argv, o = {}) => {
+    const r = M.git(root, argv, { env, ...o });
+    if (r.status !== 0) throw new Error(`git ${argv[0]} failed: ${r.err.trim() || 'exit ' + r.status}`);
+    return typeof r.out === 'string' ? r.out.trim() : r.out;
+  };
+  const stage = (rel, file, mode) => g(['update-index', '--add', '--cacheinfo', `${mode},${g(['hash-object', '-w', '--', file])},${rel}`]);
+  g(['read-tree', 'HEAD']);
+  for (const f of changed) {
+    const m = g(['ls-tree', '--full-tree', 'HEAD', '--', f]).split(' ')[0];
+    stage(f, path.join(d, 'merged', f), m === '100755' ? '100755' : '100644');
+  }
+  const nw = walkNew(path.join(d, 'new'));
+  for (const rel of nw.files) stage(rel, path.join(d, 'new', rel), fs.statSync(path.join(d, 'new', rel)).mode & 0o111 ? '100755' : '100644');
+  if (adds.length) g(['add', '-A', '--', ...adds]);
+  if (removes.length) g(['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', ...removes]);
+  const tree = g(['write-tree']);
+  if (tree === g(['rev-parse', 'HEAD^{tree}'])) { console.log(`nothing to commit: the token's copies equal HEAD; h-queue meta abort ${token} drops it`); return 1; }
+  const next = g(['commit-tree', tree, '-p', old], { input: msg.endsWith('\n') ? msg : msg + '\n' });
+  const paths = g(['diff', '--name-only', '--no-renames', '-z', old, next]).split('\0').filter(Boolean);
+  M.writeJournal(root, { token, old, new: next, paths, emptyDirs: nw.emptyDirs, time: now() });
+  R.crashAt('meta-after-journal'); R.testRun('meta-before-publish', root);
+  // Compare-and-swap: refuses when HEAD is no longer `old` (F10).
+  if (M.git(root, ['update-ref', '-m', 'h-queue meta commit ' + token, 'HEAD', next, old]).status !== 0) {
+    const cur = sh(`git -C ${q(root)} rev-parse HEAD`);
+    if (!M.isAncestor(root, next, cur)) fs.rmSync(M.journalOf(root), { force: true });
+    console.log(`HEAD moved from ${old.slice(0, 7)} to ${cur.slice(0, 7)} during the commit; nothing was published: run h-queue meta commit ${token} again`);
+    return 73;
+  }
+  R.crashAt('meta-after-publish');
+
+  // Step 5. HEAD's blobs are the merged and new/ files, so the sync writes them. The token goes
+  // before JOURNAL: a kill between the two leaves a replay that re-syncs and finds no token.
+  for (const l of M.syncFromHead(root, paths, old)) console.log(l);
+  M.makeDirs(root, nw.emptyDirs);
+  fs.rmSync(d, { recursive: true, force: true });
+  fs.unlinkSync(M.journalOf(root));
+  console.log(`committed ${next.slice(0, 7)} ${msg.split('\n')[0]}`);
+  return 0;
+}
+
+function metaAbort() {
+  const t = args[2]; if (!t) return usage();
+  const root = rootOf(process.cwd()), d = M.tokenDir(root, t);
+  if (!d || !fs.existsSync(d)) { err(`no such token: ${t}`); return 1; }
+  fs.rmSync(d, { recursive: true, force: true });
+  console.log(`aborted ${t}`);
+  return 0;
+}
+
+async function main() {
+  if (!cmd || cmd === '-h' || cmd === '--help') { console.log(HELP); return cmd ? 0 : 2; }
+  if (cmd === 'admit') return admit();
+  if (cmd === 'extend') return extend();
+  if (cmd === 'beat') return beat();
+  if (cmd === 'status') return status();
+  if (cmd === 'lock' || cmd === 'freeze') return underLanding(cmd);
+  if (cmd === 'land') return land();
+  if (cmd === 'yield') return parkCmd('yields');
+  if (cmd === 'drop') return parkCmd('drops');
+  if (cmd === 'wait') return wait();
+  if (cmd === 'resume') return resume();
+  if (cmd === 'retire') return retire();
+  if (cmd === 'stamps') return stamps();
+  if (cmd === 'meta') return meta();
+  err('unknown command ' + cmd); return 2;
+}
+
+// bin/h-snapshot commit requires this file for SHARED and bin/h-scratch-pass for SHARED and stampScan; main runs only when it is the command.
+module.exports = { SHARED, stampScan };
+if (require.main === module) main().then(c => process.exit(c), e => { console.error('h-queue: ' + e.message); process.exit(1); });

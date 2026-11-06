@@ -1,0 +1,200 @@
+#!/usr/bin/env node
+'use strict';
+// h-plans: the dependency graph of a phase's plans, checked, and which plans may start now.
+//   h-plans <phase dir>
+//   h-plans <phase dir> --ready [--landed 1,2] [--running 3] [--serial 4]
+// Reads each <NNN>-<NN>-PLAN.md frontmatter: plan, files, reads, stamps, runs_tests, depends_on,
+// consumes, produces (wave for plan sets written before depends_on: each wave then depends on every
+// earlier wave). Errors (exit 1): a depends_on naming no plan, a cycle, a consumes that no plan
+// produces or that comes from a plan this one does not depend on, two plans with no dependency
+// between them that share a test file (tests.test_file_patterns) or a file under docs/ (a note in
+// a wave set).
+// Stamps (phase 004 D07; errors in every set): a doc a plan re-verifies only for its stamp sits under
+// stamps:, never files:, and the owning task's Files line names it as `stamp: <doc>` in one backtick
+// span. A task's stamp: doc missing from stamps:, and a stamps: entry no task names, are errors.
+// stamps: never counts toward the shared-file rule, which compares files: only.
+// Notes: plans that share another file with no dependency between them (they may run
+// at once; land proves the merge), and plans that run alone (they change a dependency manifest,
+// so a worktree cannot borrow node_modules or site-packages from the main checkout). --ready prints the plans that may start now, one per
+// line, from .holden/config.yaml's worktrees.max and tests.single_test_db; --serial names plans
+// dropped at land that re-run alone. Task shape checks (errors in a depends_on set, notes in a
+// wave set): a task changing only tests, a test no tests.targeted rule runs, a skill without its
+// SKILL.md path, an Edges sub-bullet without `code:`, `test:`, `red if:` and `fails:` (or `untested:`),
+// a Measured line whose first `$ ` command is not in the task's Verify, a task with no Members line
+// (a note when no plan of the set has one: planned before the field), and code the planner built:
+// a Change naming a .patch or .diff, or a .patch or .diff file beside the plans.
+// Exit 0 = ok, 1 = graph errors, 2 = usage.
+const fs = require('fs'), path = require('path'), cp = require('child_process');
+const yaml = require(path.join(__dirname, '..', 'lib', 'yaml-lite.js'));
+
+const args = process.argv.slice(2);
+const opt = { dir: null, ready: false, landed: [], running: [], serial: [] };
+const nums = s => (s || '').split(',').filter(Boolean).map(x => parseInt(x, 10));
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '--ready') opt.ready = true;
+  else if (a === '--landed') opt.landed = nums(args[++i]);
+  else if (a === '--running') opt.running = nums(args[++i]);
+  else if (a === '--serial') opt.serial = nums(args[++i]);
+  else if (a === '-h' || a === '--help') { const h = fs.readFileSync(__filename, 'utf8').split('\n').slice(2); console.log(h.slice(0, h.findIndex(l => !l.startsWith('//'))).join('\n')); process.exit(0); }
+  else if (a.startsWith('--')) { console.error('unknown flag ' + a); process.exit(2); }
+  else opt.dir = a;
+}
+if (!opt.dir || !fs.existsSync(opt.dir)) { console.error('usage: h-plans <phase dir> [--ready ...]'); process.exit(2); }
+
+const root = cp.execSync('git rev-parse --show-toplevel', { cwd: opt.dir, encoding: 'utf8' }).trim();
+const cfgPath = path.join(root, '.holden', 'config.yaml');
+const cfg = fs.existsSync(cfgPath) ? yaml.load(cfgPath) : {};
+const wcfg = cfg.worktrees || {}, tcfg = cfg.tests || {};
+// A plan that changes one of these runs with nothing else in flight.
+const { aloneFile } = require(path.join(__dirname, '..', 'lib', 'manifests.js'));
+// bin/h-queue's norm: a path with a leading `./` and the same path without it name one doc.
+const norm = p => path.posix.normalize(String(p)).replace(/^\.\//, '');
+
+const plans = [];
+const planFiles = fs.readdirSync(opt.dir).filter(f => /^[\d.]+-\d+-PLAN\.md$/.test(f)).sort();
+for (const f of planFiles) {
+  const text = fs.readFileSync(path.join(opt.dir, f), 'utf8');
+  const m = text.match(/^---\n([\s\S]*?)\n---/);
+  if (!m) { console.error(`${f}: no frontmatter`); process.exit(1); }
+  const fm = yaml.parse(m[1]);
+  plans.push({ file: f, n: fm.plan, wave: fm.wave, files: fm.files || [], tests: fm.runs_tests !== false,
+    hasDeps: Object.prototype.hasOwnProperty.call(fm, 'depends_on'), deps: (fm.depends_on || []).map(Number),
+    consumes: fm.consumes || [], produces: fm.produces || [], reads: fm.reads || [], stamps: fm.stamps == null ? [] : fm.stamps });
+}
+for (const p of plans) if (!Array.isArray(p.reads) || p.reads.some(r => typeof r !== 'string')) { console.error(`${p.file}: reads must be a list of paths`); process.exit(1); }
+for (const p of plans) if (!Array.isArray(p.stamps) || p.stamps.some(r => typeof r !== 'string')) { console.error(`${p.file}: stamps must be a list of paths`); process.exit(1); }
+if (!plans.length) { console.error('no plan files in ' + opt.dir); process.exit(2); }
+const byN = new Map(plans.map(p => [p.n, p]));
+const nn = n => String(n).padStart(2, '0');
+const errors = [], notes = [];
+
+const explicit = plans.some(p => p.hasDeps);
+if (explicit) { for (const p of plans) if (!p.hasDeps) errors.push(`${nn(p.n)}: no depends_on while other plans declare it (write depends_on: [] for none)`); }
+else for (const p of plans) p.deps = plans.filter(q => q.wave < p.wave).map(q => q.n);
+for (const p of plans) for (const d of p.deps) if (!byN.has(d)) errors.push(`${nn(p.n)}: depends_on ${d}, no such plan`);
+
+// transitive dependencies, with cycle detection
+const closure = new Map();
+function deps(n, stack = []) {
+  if (closure.has(n)) return closure.get(n);
+  if (stack.includes(n)) { errors.push('cycle: ' + [...stack, n].map(nn).join(' -> ')); return new Set(); }
+  const s = new Set();
+  for (const d of (byN.get(n) || { deps: [] }).deps) { if (!byN.has(d)) continue; s.add(d); for (const x of deps(d, [...stack, n])) s.add(x); }
+  closure.set(n, s); return s;
+}
+for (const p of plans) deps(p.n);
+
+for (const p of plans) for (const c of p.consumes) {
+  const from = plans.filter(q => q.n !== p.n && q.produces.includes(c)).map(q => q.n);
+  if (!from.length) errors.push(`${nn(p.n)}: consumes ${c}, which no plan produces (consumes lists only what this phase adds)`);
+  else if (!from.some(q => closure.get(p.n).has(q))) errors.push(`${nn(p.n)}: consumes ${c} from plan ${from.map(nn).join(', ')} without depending on it`);
+}
+const globToRe = g => new RegExp('^' + g.split('**/').map(p => p.split('**').map(q => q.split('*').map(r => r.replace(/[.+^${}()|[\]\\?]/g, '\\$&')).join('[^/]*')).join('.*')).join('(?:.*/)?') + '$');
+const testPats = (tcfg.test_file_patterns || ['tests/**']).map(globToRe);
+// Two unchained plans may share a code file (different functions; land proves the merge), but a
+// shared test file or doc is edited in one place by both, so they are chained. Only `files` is
+// compared: a doc under `stamps:` is not written by the plan (phase 004 D01).
+const chainFile = f => f.startsWith('docs/') || testPats.some(r => r.test(f));
+const unchained = [];
+for (let i = 0; i < plans.length; i++) for (let j = i + 1; j < plans.length; j++) {
+  const a = plans[i], b = plans[j];
+  if (closure.get(a.n).has(b.n) || closure.get(b.n).has(a.n)) continue;
+  const shared = a.files.filter(f => b.files.includes(f));
+  const chain = shared.filter(chainFile), other = shared.filter(f => !chainFile(f));
+  if (chain.length) unchained.push(`${nn(a.n)} and ${nn(b.n)} share ${chain.join(', ')} with no dependency: a shared test file or doc chains them; add depends_on in the order their changes build on each other`);
+  if (other.length) notes.push(`${nn(a.n)} and ${nn(b.n)} share ${other.join(', ')} with no dependency: they may run at once; land proves the merge`);
+}
+if (explicit) errors.push(...unchained); else notes.push(...unchained);
+for (const p of plans) { p.alone = p.files.some(aloneFile) || opt.serial.includes(p.n); if (p.files.some(aloneFile)) notes.push(`${nn(p.n)} runs alone: it changes ${p.files.filter(aloneFile).join(', ')}`); }
+for (const p of plans) for (const r of p.reads) if (p.files.includes(r)) notes.push(`${nn(p.n)} lists ${r} under both files and reads; reads is for files it does not write`);
+
+// Proof shapes h-test refuses: a task whose Files are only tests (nothing for the test to be red
+// against), a test file no tests.targeted rule runs, and a skill named with no SKILL.md path.
+// In a plan set written before depends_on these are notes, so a phase already planned still
+// executes.
+const fixturePats = (tcfg.fixture_patterns || ['**/fixtures/**', '**/__snapshots__/**', '**/*.bin']).map(globToRe);
+const targeted = (tcfg.targeted || [{ match: '**' }]).map(r => globToRe(r.match));
+const shapes = [], members = [], stampErrs = [];
+for (const p of plans) {
+  const body = fs.readFileSync(path.join(opt.dir, p.file), 'utf8');
+  // The executor has no Skill tool: a pass a skill defines is applied by hand from its SKILL.md.
+  const fmEnd = body.split('\n').indexOf('---', 1);
+  body.split('\n').forEach((l, i) => {
+    if (i > fmEnd && /\bskill\b/i.test(l) && !/SKILL\.md/.test(l)) shapes.push(`${nn(p.n)} line ${i + 1} names a skill without its SKILL.md path: the executor has no Skill tool; write "apply <path>/SKILL.md by hand"`);
+  });
+  const listed = new Set(p.stamps.map(norm)), named = new Set();
+  for (const t of body.split(/^### /m).slice(1)) {
+    const name = (t.match(/^Task (\d+)/) || [])[1]; if (!name) continue;
+    const field = k => (t.match(new RegExp(`^- ${k}:([\\s\\S]*?)(?=^- [A-Z][\\w ]*:|(?![\\s\\S]))`, 'm')) || [])[1] || '';
+    const line = field('Files');
+    // Phase 004 D07: a task names each doc it re-verifies as `stamp: <doc>` in one backtick span.
+    // The whitespace filter below keeps that span out of `files`: it is never a write, a test or code.
+    for (const [, d] of line.matchAll(/`stamp: ([^`\s]+)`/g)) {
+      named.add(norm(d));
+      if (!listed.has(norm(d))) stampErrs.push(`${nn(p.n)} task ${name} names stamp: ${norm(d)}, which the plan's stamps: does not list; add it there`);
+    }
+    const files = [...line.matchAll(/`([^`]+)`/g)].map(m => m[1]).filter(f => !/\s/.test(f));
+    const tests = files.filter(f => testPats.some(r => r.test(f)) && !fixturePats.some(r => r.test(f)));
+    const code = files.filter(f => !testPats.some(r => r.test(f)) && !/\.md$|^\.planning\//.test(f));
+    if (tests.length && !code.length) shapes.push(`${nn(p.n)} task ${name} changes only test files (${tests.join(', ')}): h-test refuses it; fold the test into the task whose change turns it green, prove guards of code already landed with --refactor, or give a scratch proof (h-test --scratch <parent> --patch <file> -- <command>) with its expected exit`);
+    for (const f of tests) if (!targeted.some(r => r.test(f))) shapes.push(`${nn(p.n)} task ${name}: no tests.targeted rule runs ${f}; say which command runs it, or add the rule`);
+    // Each edge names the code that makes its outcome true, its test, and the mutation that turns it red.
+    const edges = field('Edges');
+    if (edges.trim() && !/^\s*`?none:/.test(edges)) {
+      const subs = edges.split(/^\s{2,}- /m).slice(1).map(e => e.replace(/\s+/g, ' ').trim());
+      const bad = subs.filter(e => !/\buntested:/.test(e) && !(/\bcode:/.test(e) && /\btest:/.test(e) && /\bred if:/.test(e) && /\bfails:/.test(e)));
+      if (!subs.length) shapes.push(`${nn(p.n)} task ${name}: Edges has no sub-bullets; write one per edge as \`<input> -> <outcome>; code: ...; test: ...; red if: ...; fails: ...\` or \`...; untested: <why>\``);
+      else if (bad.length) shapes.push(`${nn(p.n)} task ${name}: ${bad.length} of ${subs.length} edges lack code:, test:, red if: and fails: (or untested:), first: "${bad[0].slice(0, 70)}"`);
+    }
+    // A guarantee or set the task states lists its members; `n/a: <why>` when it states neither.
+    if (!field('Members').trim()) members.push(`${nn(p.n)} task ${name}: no Members line; quote each guarantee or set the decision or Change states, paste the grep, one line per member with its enforcing line and test, or write \`n/a: <why>\``);
+    // A measured value is the Verify's own command, run at the base commit; the executor writes the code.
+    const measured = field('Measured'), flat = x => x.replace(/\s+/g, ' ').trim();
+    if (measured.trim() && !/^\s*"?n\/a/i.test(measured)) {
+      const cmd = (measured.match(/`\$ ([^`]+)`/) || measured.match(/^\s*\$ (.+)$/m) || [])[1];
+      if (!cmd) shapes.push(`${nn(p.n)} task ${name}: Measured has no \`$ <command>\`; paste the Verify's command, byte for byte, and what it printed`);
+      else if (!flat(field('Verify')).includes(flat(cmd))) shapes.push(`${nn(p.n)} task ${name}: Measured ran \`${flat(cmd).slice(0, 70)}\`, which is not in the task's Verify; measure the Verify's own command`);
+    }
+    for (const [, pf] of field('Change').matchAll(/([\w./-]+\.(?:patch|diff))\b/g))
+      shapes.push(`${nn(p.n)} task ${name}: Change names ${pf}; describe the code, the executor writes it`);
+  }
+  for (const d of listed) if (!named.has(d)) stampErrs.push(`${nn(p.n)} lists ${d} under stamps:, which no task's Files line names as \`stamp: ${d}\``);
+}
+for (const f of fs.readdirSync(opt.dir).filter(f => /\.(patch|diff)$/.test(f)))
+  shapes.push(`${f} sits beside the plans: the planner describes the change and the executor builds it`);
+if (explicit) errors.push(...shapes); else notes.push(...shapes);
+// A plan set with no Members line anywhere was planned before the field: notes, so it still executes.
+const membersKnown = plans.some(p => /^- Members:/m.test(fs.readFileSync(path.join(opt.dir, p.file), 'utf8')));
+if (explicit && membersKnown) errors.push(...members); else notes.push(...members);
+// D07 (phase 004): errors in every set. A plan that carries stamps: was written after the field.
+errors.push(...stampErrs);
+if (errors.length) { for (const e of errors) console.log('error: ' + e); process.exit(1); }
+
+if (opt.ready) {
+  const max = Number(wcfg.max) || 1, single = tcfg.single_test_db === true;
+  const running = plans.filter(p => opt.running.includes(p.n));
+  if (running.some(p => p.alone)) process.exit(0);
+  const waiting = plans.filter(p => !opt.landed.includes(p.n) && !opt.running.includes(p.n) && p.deps.every(d => opt.landed.includes(d)));
+  let slots = max - running.length, testing = running.some(p => p.tests);
+  const out = [];
+  for (const p of waiting) {
+    if (slots <= 0) break;
+    if (p.alone) { if (!running.length && !out.length) { out.push(p.n); break; } continue; }
+    if (single && p.tests && testing) continue;
+    out.push(p.n); slots--; if (p.tests) testing = true;
+  }
+  for (const n of out) console.log(nn(n));
+  process.exit(0);
+}
+
+// layout: each plan's level is the longest dependency chain beneath it
+const level = new Map();
+const lv = n => level.has(n) ? level.get(n) : (level.set(n, Math.max(0, ...byN.get(n).deps.map(d => lv(d) + 1))), level.get(n));
+for (const p of plans) lv(p.n);
+console.log(`plans: ${plans.length}; graph from ${explicit ? 'depends_on' : 'wave (no depends_on in this set)'}`);
+for (let l = 0; l <= Math.max(...level.values()); l++) {
+  const at = plans.filter(p => level.get(p.n) === l);
+  console.log(`level ${l + 1}: ` + at.map(p => nn(p.n) + (p.deps.length ? ` (after ${p.deps.map(nn).join(', ')})` : '') + (p.alone ? ' [alone]' : '')).join('; '));
+}
+for (const n of notes) console.log('note: ' + n);

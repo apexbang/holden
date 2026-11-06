@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# detach-wait <name> [timeout_s=1800]: run as a background Bash task; exits (and so wakes Claude)
+# when the run writes its EXIT line or the timeout passes.
+set -uo pipefail
+name=$1; limit=${2:-1800}
+R=$HOME/.claude/detached; out=$R/$name.out
+[ -e "$R/$name.run" ] || { echo "detach-wait: no run '$name'" >&2; exit 2; }
+echo $$ > "$R/$name.waiter"
+start=$(date +%s)
+until grep -q '^EXIT ' "$out" 2>/dev/null; do
+  if [ $(( $(date +%s) - start )) -ge "$limit" ]; then
+    echo "TIMEOUT: '$name' still running after ${limit}s; check $out"; tail -5 "$out"; exit 1
+  fi
+  sleep 5
+done
+echo "FINISHED '$name' ($(grep '^EXIT ' "$out" | tail -1)) at $(date '+%T %Z')"
+tail -25 "$out"
+echo "Act on it, then: detach-seen $name"

@@ -1,0 +1,79 @@
+#!/usr/bin/env node
+'use strict';
+// link: install holden into ~/.claude by symlink (skills, agents, the detach helpers into
+// ~/.claude/bin, and ~/.claude/holden for the repo itself), wire its hooks and statusline into
+// settings.json, and set aside the GSD install. The prompts name every holden file as
+// ~/.claude/holden/..., so the repo can be cloned anywhere: this link is the one place its real
+// path is written.
+// Idempotent. Flags: --dry-run, --unlink (remove holden links only).
+const fs = require('fs'), path = require('path'), os = require('os');
+const dry = process.argv.includes('--dry-run'), unlink = process.argv.includes('--unlink');
+const H = path.resolve(__dirname, '..');
+const C = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const NODE = fs.existsSync('/usr/bin/node-22') ? '/usr/bin/node-22' : process.execPath;
+const stamp = new Date().toISOString().slice(0, 10);
+const aside = path.join(C, `gsd-removed-${stamp}`);
+function act(msg, fn) { console.log((dry ? '[dry] ' : '') + msg); if (!dry) fn(); }
+function symlink(target, link) {
+  if (fs.existsSync(link) || isLink(link)) { if (isLink(link) && fs.readlinkSync(link) === target) return; act(`replace ${link}`, () => fs.rmSync(link, { recursive: true, force: true })); }
+  act(`link ${link} -> ${target}`, () => fs.symlinkSync(target, link));
+}
+function isLink(p) { try { return fs.lstatSync(p).isSymbolicLink(); } catch (e) { return false; } }
+fs.mkdirSync(path.join(C, 'skills'), { recursive: true }); fs.mkdirSync(path.join(C, 'agents'), { recursive: true }); fs.mkdirSync(path.join(C, 'bin'), { recursive: true });
+const DETACH = ['detach', 'detach-wait', 'detach-seen'];
+
+if (unlink) {
+  for (const d of fs.readdirSync(path.join(C, 'skills'))) { const p = path.join(C, 'skills', d); if (d.startsWith('h-') && isLink(p)) act(`unlink ${p}`, () => fs.unlinkSync(p)); }
+  for (const f of fs.readdirSync(path.join(C, 'agents'))) { const p = path.join(C, 'agents', f); if (f.startsWith('holden-') && isLink(p)) act(`unlink ${p}`, () => fs.unlinkSync(p)); }
+  for (const f of DETACH) { const p = path.join(C, 'bin', f); if (isLink(p) && fs.readlinkSync(p).startsWith(H)) act(`unlink ${p}`, () => fs.unlinkSync(p)); }
+  const home = path.join(C, 'holden'); if (isLink(home) && fs.readlinkSync(home) === H) act(`unlink ${home}`, () => fs.unlinkSync(home));
+  process.exit(0);
+}
+// 0. the repo itself, at the one path every prompt uses
+symlink(H, path.join(C, 'holden'));
+// 1. skills and agents
+for (const d of fs.readdirSync(path.join(H, 'skills'))) symlink(path.join(H, 'skills', d), path.join(C, 'skills', d));
+for (const f of fs.readdirSync(path.join(H, 'agents'))) symlink(path.join(H, 'agents', f), path.join(C, 'agents', f));
+// h-execute and h-review launch long runs through ~/.claude/bin/detach; the two detach hooks are wired below.
+for (const f of DETACH) symlink(path.join(H, 'bin', f), path.join(C, 'bin', f));
+// 2. set GSD aside (skills, agents, hooks, engine).
+const gsdSkills = fs.readdirSync(path.join(C, 'skills')).filter(d => d.startsWith('gsd-') && !isLink(path.join(C, 'skills', d)));
+const gsdAgents = fs.readdirSync(path.join(C, 'agents')).filter(f => f.startsWith('gsd-') && !isLink(path.join(C, 'agents', f)));
+const gsdHooks = fs.existsSync(path.join(C, 'hooks')) ? fs.readdirSync(path.join(C, 'hooks')).filter(f => f.startsWith('gsd-')) : [];
+const engine = ['get-shit-done', 'gsd-pristine', 'gsd-migration-journal', 'gsd-file-manifest.json', 'gsd-install-state.json', 'gsd-disabled-2026-09-05'].filter(f => fs.existsSync(path.join(C, f)));
+if (gsdSkills.length + gsdAgents.length + gsdHooks.length + engine.length) {
+  act(`set aside ${gsdSkills.length} skills, ${gsdAgents.length} agents, ${gsdHooks.length} hooks, ${engine.length} engine entries -> ${aside}`, () => {
+    for (const [sub, list] of [['skills', gsdSkills], ['agents', gsdAgents], ['hooks', gsdHooks]]) { fs.mkdirSync(path.join(aside, sub), { recursive: true }); for (const f of list) fs.renameSync(path.join(C, sub, f), path.join(aside, sub, f)); }
+    for (const f of engine) fs.renameSync(path.join(C, f), path.join(aside, f));
+  });
+}
+// 3. settings.json: hooks + statusline + drop gsd skillOverrides
+const sp = path.join(C, 'settings.json'); const s = fs.existsSync(sp) ? JSON.parse(fs.readFileSync(sp, 'utf8')) : {};
+const hook = (file, timeout) => ({ type: 'command', command: `"${NODE}" "${path.join(H, 'hooks', file)}"`, ...(timeout ? { timeout } : {}) });
+const newHooks = {
+  PreToolUse: [
+    { matcher: 'Bash', hooks: [{ type: 'command', command: path.join(H, 'hooks', 'detach-guard-hook'), timeout: 5 }] },
+  ],
+  PostToolUse: [
+    { matcher: 'Bash|Edit|Write|MultiEdit|Agent|Task', hooks: [hook('holden-context-monitor.js', 10)] },
+    { matcher: 'Read', hooks: [hook('holden-injection-scanner.js', 5)] },
+  ],
+  Stop: [
+    { hooks: [{ type: 'command', command: path.join(H, 'hooks', 'detach-stop-hook'), timeout: 10 }] },
+  ],
+};
+// keep any hooks the user had that are neither GSD's nor holden's own (those are rewritten above), once each
+const seen = new Set(Object.values(newHooks).flat().map(g => JSON.stringify(g)));
+for (const ev of Object.keys(s.hooks || {})) for (const g of s.hooks[ev]) {
+  if (g.hooks.some(h => /gsd-|\/holden\/hooks\/|\/\.claude\/bin\/detach-/.test(h.command))) continue;
+  const key = JSON.stringify(g); if (seen.has(key)) continue; seen.add(key);
+  (newHooks[ev] = newHooks[ev] || []).push(g);
+}
+s.hooks = newHooks;
+// refreshInterval keeps the statusline moving while the session is idle: the reset countdowns and
+// the running subagents' context.
+s.statusLine = { type: 'command', command: `"${NODE}" "${path.join(H, 'hooks', 'holden-statusline.js')}"`, refreshInterval: 20 };
+if (s.skillOverrides) for (const k of Object.keys(s.skillOverrides)) if (k.startsWith('gsd-')) delete s.skillOverrides[k];
+if (s.skillOverrides && !Object.keys(s.skillOverrides).length) delete s.skillOverrides;
+act(`write ${sp} (backup at ${sp}.bak-pre-holden-${stamp})`, () => { fs.copyFileSync(sp, `${sp}.bak-pre-holden-${stamp}`); fs.writeFileSync(sp, JSON.stringify(s, null, 2) + '\n'); });
+console.log('done. restart Claude Code sessions to load the new skills.');

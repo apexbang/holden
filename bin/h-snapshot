@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+'use strict';
+// h-snapshot: a commit on no branch holding <base>'s tree plus the working copies of the named
+// paths, so a review, a proof or a patch can read uncommitted work as a range; and the commit of one
+// such patch onto the current branch, which skills/h-quick runs under h-queue lock.
+//   h-snapshot [--base <ref>] <path>...            prints <base sha>..<snapshot sha>
+//   h-snapshot commit <patch> -F <message file>    prints <old HEAD sha>..<new HEAD sha>
+// A snapshot leaves the index, the working tree and the stash untouched. Paths are relative to the
+// repo root. A path deleted in the working tree is deleted in the snapshot. --base defaults to HEAD;
+// a later snapshot taken with --base <an earlier one> holds only what changed since it.
+// `git diff --binary <range>` is a patch that `git apply` restores, new files included.
+// commit applies the patch to HEAD's tree on a scratch index, commits that tree with HEAD as its
+// parent and the message file's text, and moves the current branch only if it still points at that
+// HEAD. It then resets the main index's entries for the paths the commit changes, and no others, to
+// the new commit. The working tree is untouched. It runs only inside h-queue lock, and refuses a
+// patch that changes a shared file (SHARED in bin/h-queue).
+// Exit 0 printed or committed; 1 a path neither in <base> nor in the working tree, no path changed
+// since <base>, git refused a path, or for commit: the patch does not apply at HEAD or changes
+// nothing there, it changes a shared file, HEAD is detached or has no commit, or the branch moved
+// during the commit, each with nothing changed;
+// 2 usage, or commit outside h-queue lock; 3 committed, but the main index kept its old entries for
+// the paths the printed `git reset` line names.
+const fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process');
+
+const HELP = (() => { const ls = fs.readFileSync(__filename, 'utf8').split('\n').slice(2); return ls.slice(0, ls.findIndex(l => !l.startsWith('//'))).join('\n'); })();
+const USAGE = 'usage: h-snapshot [--base <ref>] <path>...';
+const norm = p => path.posix.normalize(String(p)).replace(/^\.\//, '');
+
+// argv, never a shell string: a path is passed to git as one argument whatever it holds.
+// raw keeps stdout as git wrote it: a -z path list whose first or last path starts or ends with a space.
+function git(args, { cwd, env, raw } = {}) {
+  const r = cp.spawnSync('git', args, { cwd, env: env || process.env, encoding: 'utf8' });
+  return { ok: r.status === 0, out: raw ? (r.stdout || '') : (r.stdout || '').trim(), err: (r.stderr || '').trim() };
+}
+function fail(code, msg) { if (msg) console.error(msg); return code; }
+
+function snapshot(argv) {
+  let ref = 'HEAD';
+  const paths = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-h' || a === '--help') { console.log(HELP); return 0; }
+    if (a === '--base') { if (i + 1 >= argv.length) return fail(2, USAGE); ref = argv[++i]; continue; }
+    if (a.startsWith('--')) return fail(2, `unknown flag ${a}`);
+    paths.push(a);
+  }
+  if (!paths.length) return fail(2, USAGE);
+
+  const top = git(['rev-parse', '--show-toplevel']);
+  if (!top.ok) return fail(2, 'not a git repository');
+  const root = top.out;
+  const b = git(['-C', root, 'rev-parse', '--verify', '-q', `${ref}^{commit}`]);
+  if (!b.ok) return fail(2, `not a commit: ${ref}`);
+  const base = b.out, base7 = base.slice(0, 7);
+
+  const ps = paths.map(norm);
+  for (const p of ps) {
+    if (!git(['-C', root, 'cat-file', '-e', `${base}:${p}`]).ok && !fs.existsSync(path.join(root, p)))
+      return fail(1, `no such path at ${base7} or in the working tree: ${p}`);
+  }
+
+  // A scratch index, as bin/h-test builds its temporary commit: the real index is never read or written.
+  const idx = path.join(os.tmpdir(), 'h-snapshot-index-' + process.pid);
+  // A path holding * or ? names only itself, so the snapshot never takes a file the caller did not name.
+  const env = { ...process.env, GIT_INDEX_FILE: idx, GIT_LITERAL_PATHSPECS: '1' };
+  let tree;
+  try {
+    const rt = git(['read-tree', base], { cwd: root, env });
+    if (!rt.ok) return fail(1, rt.err);
+    const add = git(['add', '-A', '--', ...ps], { cwd: root, env });
+    if (!add.ok) return fail(1, add.err);
+    const wt = git(['write-tree'], { cwd: root, env });
+    if (!wt.ok) return fail(1, wt.err);
+    tree = wt.out;
+  } finally {
+    try { fs.unlinkSync(idx); } catch (e) {}
+  }
+  if (tree === git(['-C', root, 'rev-parse', `${base}^{tree}`]).out) return fail(1, `nothing changed in ${ps.join(' ')} since ${base7}`);
+  const ct = git(['-C', root, 'commit-tree', tree, '-p', base, '-m', `h-snapshot: ${ps.join(' ')}`]);
+  if (!ct.ok) return fail(1, ct.err);
+  process.stdout.write(`${base}..${ct.out}\n`);
+  return 0;
+}
+
+// The switch-off quick's lock commit (skills/h-quick): exactly the reviewed patch, built on a scratch
+// index from HEAD so an unrelated staged file in the main index is neither published nor unstaged.
+function commitPatch(args) {
+  const CUSAGE = 'usage: h-snapshot commit <patch> -F <message file>';
+  if (args.length !== 3 || args[1] !== '-F') return fail(2, CUSAGE);
+  const patch = path.resolve(process.cwd(), args[0]), msg = path.resolve(process.cwd(), args[2]);
+  for (const f of [patch, msg]) if (!fs.existsSync(f)) return fail(2, `no such file: ${f}`);
+  // bin/h-queue underLanding sets this for the command it wraps: no landing or metadata commit moves HEAD meanwhile.
+  if (process.env.HOLDEN_LANDING_HELD !== '1')
+    return fail(2, "h-snapshot commit runs under the landing lock: h-queue lock -- 'h-snapshot commit <patch> -F <message file>'");
+
+  const top = git(['rev-parse', '--show-toplevel']);
+  if (!top.ok) return fail(2, 'not a git repository');
+  const root = top.out;
+  const sym = git(['-C', root, 'symbolic-ref', '-q', 'HEAD']);
+  if (!sym.ok) return fail(1, 'HEAD is detached; h-snapshot commit moves a branch');
+  const ref = sym.out;
+  const h = git(['-C', root, 'rev-parse', '--verify', '-q', 'HEAD^{commit}']);
+  if (!h.ok) return fail(1, `${ref} has no commit; h-snapshot commit needs a parent`);
+  const head = h.out, head7 = head.slice(0, 7);
+
+  const idx = path.join(os.tmpdir(), 'h-snapshot-commit-index-' + process.pid);
+  const env = { ...process.env, GIT_INDEX_FILE: idx };
+  let tree;
+  try {
+    const rt = git(['read-tree', head], { cwd: root, env });
+    if (!rt.ok) return fail(1, rt.err);
+    const ap = git(['apply', '--cached', patch], { cwd: root, env });
+    if (!ap.ok) return fail(1, `the patch does not apply at HEAD ${head7}; nothing committed\n${ap.err}`);
+    const wt = git(['write-tree'], { cwd: root, env });
+    if (!wt.ok) return fail(1, wt.err);
+    tree = wt.out;
+  } finally {
+    try { fs.unlinkSync(idx); } catch (e) {}
+  }
+
+  // --no-renames lists both names of a rename, so each reaches the SHARED check and the reset.
+  const dt = git(['-C', root, 'diff-tree', '-r', '--name-only', '--no-renames', '-z', `${head}^{tree}`, tree], { raw: true });
+  if (!dt.ok) return fail(1, dt.err);
+  const paths = dt.out.split('\0').filter(Boolean);
+  // A reset with no pathspec would reset the whole main index, the unrelated staged entries with it.
+  if (!paths.length) return fail(1, `the patch changes nothing at HEAD ${head7}; nothing committed`);
+  // Required here, not at the top, so a snapshot never loads bin/h-queue.
+  const { SHARED } = require(path.join(__dirname, 'h-queue'));
+  const bad = paths.filter(p => SHARED.includes(p));
+  if (bad.length) return fail(1, `refusing: the patch changes shared files: ${bad.join(', ')}; they change through h-queue meta commit (docs/reference.md § Shared files)`);
+
+  const ct = git(['-C', root, 'commit-tree', tree, '-p', head, '-F', msg]);
+  if (!ct.ok) return fail(1, ct.err);
+  const commit = ct.out, commit7 = commit.slice(0, 7);
+  const first = fs.readFileSync(msg, 'utf8').split('\n')[0];
+  // The old value makes the move conditional: a commit from outside holden since the read above refuses it.
+  if (!git(['-C', root, 'update-ref', '-m', `h-snapshot commit: ${first}`, ref, commit, head]).ok)
+    return fail(1, `the branch moved from ${head7} during the commit; nothing committed`);
+
+  const mainEnv = { ...process.env, GIT_LITERAL_PATHSPECS: '1' };
+  delete mainEnv.GIT_INDEX_FILE;
+  if (!git(['-C', root, 'reset', '-q', commit, '--', ...paths], { env: mainEnv }).ok)
+    return fail(3, `committed ${head7}..${commit7}; the main index still holds the old entries; run: git reset -q HEAD -- ${paths.join(' ')}`);
+  process.stdout.write(`${head}..${commit}\n`);
+  return 0;
+}
+
+// `commit` as the first word is the mode; `h-snapshot ./commit` still snapshots a file named commit.
+process.exitCode = process.argv[2] === 'commit' ? commitPatch(process.argv.slice(3)) : snapshot(process.argv.slice(2));

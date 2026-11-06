@@ -1,0 +1,72 @@
+# .holden/config.yaml — per-repo knobs. Everything else is global.
+holden: 1
+parallel_waves: false      # true: plans with no dependency between them run at once, one worktree each (docs/reference.md § Parallel plans)
+concurrency: false         # true: every package (a plan, a quick, an inline fix) runs in its own worktree whatever parallel_waves says, lands through h-queue under the repo's landing lock, and the deploy runs under h-queue freeze (docs/reference.md § Packages). Read from the main checkout's config only.
+models:                    # haiku | sonnet | opus | fable | inherit; inherit = the session model capped at Opus
+  researcher: inherit
+  planner: inherit
+  executor: sonnet
+  reviewer: inherit
+  tracer: sonnet           # /h-trace's code-reading agents
+  auditor_map: haiku       # /h-audit's map: lists and counts, every count rerun by the main session
+  auditor: sonnet          # /h-audit's slice reviews
+  verifier: opus           # /h-audit's per-slice verification; the main session checks highs and overturns
+review:
+  plan_tier: self          # none | self | codex; the plan review is where Codex pays off
+  diff_tier: self          # none | self | codex; the diff review after the last plan lands
+  codex_paths: []          # globs; a phase touching any of these defaults its plan tier to codex
+  diff_axes: one           # one | two; two runs the self diff review as two agents, standards and decision, never reranked
+tests:
+  test_file_patterns:
+    - "tests/**"
+  fixture_patterns:        # under the test patterns but never passed to a runner as a test path
+    - "**/fixtures/**"
+    - "**/__snapshots__/**"
+    - "**/*.bin"
+  targeted:
+    - match: "tests/**"
+      run: "pytest {files} -q"
+    # - match: "client/src/**/*.test.js"
+    #   run: "npm --prefix client test -- {files_rel:client/}"   # {files_rel:<prefix>} strips the prefix for a run rooted there
+  worktree_setup: []       # commands run in every fresh worktree (h-test proofs, executor worktrees) before its tests,
+                           # $REPO = the main checkout; each must succeed. e.g. "ln -s $REPO/client/node_modules
+                           # client/node_modules" (a worktree has no node_modules), "ln -s $REPO/.env .env"
+  full:
+    - "pytest -q"
+  deps: []                 # a changed dependency manifest runs `h-test --deps`: does the set resolve, does the code
+                           # still build and collect. Each rule runs from the matched manifest's directory. e.g.
+    # - match: "**/requirements*.txt"
+    #   run: "pytest --collect-only -q"
+    # - match: "**/package.json"
+    #   run: "npm ci --dry-run && npx tsc --noEmit"
+    # - match: "**/go.mod"
+    #   run: "go mod tidy -diff && go build ./... && go test -list . ./..."
+    #   count: '^(Test|Example|Fuzz|Benchmark)'   # optional: lines matching are counted into the ledger line
+    # - match: "**/Cargo.toml"
+    #   run: "cargo check --all-targets && cargo test --no-run -q"
+    # - match: "**/CMakeLists.txt"
+    #   run: "cmake -S . -B build && cmake --build build"
+  summary: []              # extra regexes for a runner's count lines; pytest, jest, vitest, mocha, node:test,
+                           # go test, cargo, ctest and criterion are built in
+  missing_name: []         # extra regexes for "the parent failed on a missing name or a failed build, not on the
+                           # assertion"; Python, JS/TS, Go, Rust and C/C++ are built in
+  single_test_db: false
+  stamp_ignore:            # paths that cannot change behaviour; commits touching only these keep the stamp valid
+                           # docs/** only if no test reads data there; carve such a directory out
+    - ".planning/**"
+    - ".holden/**"
+    - "docs/**"
+    - "**/*.md"
+worktrees:                 # read when parallel_waves or concurrency is true
+  smoke: null              # a quick command proving a fresh worktree can run tests (imports, conftest, the test DB);
+                           # h-worktree preflight runs it once before any executor starts
+  max: 3                   # executors in flight at once
+deploy: null
+prod_read: null            # /h-trace steps 5-6: a command taking SQL on stdin, read-only at the database
+                           # (a read-only role or replica); null skips the prod steps. Never a write route.
+paths:
+  phases: .planning/phases
+  archive: .planning/archive
+  quick: .planning/quick
+  traces: .planning/traces
+  audits: .planning/audits

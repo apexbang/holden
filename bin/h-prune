@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+'use strict';
+// h-prune: the subtraction side of h-learn. h-learn only adds sentences; this lists the ones that
+// may have stopped earning their place, for the operator to keep or cut in an h-learn session.
+//   h-prune --open [<agent>]           open observation lines (not struck, declined or clean)
+//   h-prune --quiet [<agent>] [--phases N]
+//       sentences added by accepted learn edits that are still in the file, with how many phases
+//       have landed since and how many lines named that agent since. Default N = 20.
+// Quiet is not useless: a sentence that prevents a gap leaves no trace when it works. The list is
+// a candidate list; the operator decides each one, as a Delete proposal in /h-learn review.
+// Matching is by text, whitespace-insensitive, so a reflowed sentence still counts as present;
+// lines a commit only re-wrapped (present in the parent) are left out.
+const fs = require('fs'), path = require('path'), cp = require('child_process');
+
+const HOLDEN = path.join(__dirname, '..');
+const OBS = path.join(HOLDEN, 'observations.md');
+const args = process.argv.slice(2);
+const opt = { open: false, quiet: false, agent: null, phases: 20 };
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '--open') opt.open = true;
+  else if (a === '--quiet') opt.quiet = true;
+  else if (a === '--phases') opt.phases = parseInt(args[++i], 10);
+  else if (a === '-h' || a === '--help') { console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 12).join('\n')); process.exit(0); }
+  else if (a.startsWith('--')) { console.error('unknown flag ' + a); process.exit(2); }
+  else opt.agent = a;
+}
+if (opt.open === opt.quiet || !(opt.phases > 0)) { console.error('usage: h-prune --open [<agent>] | --quiet [<agent>] [--phases N]'); process.exit(2); }
+
+const git = (...a) => { const r = cp.spawnSync('git', ['-C', HOLDEN, ...a], { encoding: 'utf8', maxBuffer: 1 << 28 }); return r.status === 0 ? r.stdout : ''; };
+const norm = s => s.replace(/\s+/g, ' ').trim();
+
+// - <date> <repo> <NNN> <agent>: ...   or   - <date> <repo> <NNN>: clean
+const LINE = /^- (\d{4}-\d{2}-\d{2}) (\S+) (\S+?)(?: ([a-z-]+))?: /;
+const obs = (fs.existsSync(OBS) ? fs.readFileSync(OBS, 'utf8') : '').split('\n').filter(l => l.startsWith('- ')).map(l => {
+  const m = l.match(LINE); if (!m) return null;
+  const clean = !m[4] && /: clean\b/.test(l);
+  return { text: l, date: m[1], phase: `${m[2]} ${m[3]}`, agent: m[4] || null, clean,
+    struck: /\bstruck \(/.test(l), declined: /declined: /.test(l) };
+}).filter(Boolean);
+
+if (opt.open) {
+  const open = obs.filter(o => !o.clean && !o.struck && !o.declined && (!opt.agent || o.agent === opt.agent));
+  for (const o of open) console.log(o.text);
+  const by = {}; for (const o of open) by[o.agent] = (by[o.agent] || 0) + 1;
+  console.error(`${open.length} open: ${Object.entries(by).sort((a, b) => b[1] - a[1]).map(([a, n]) => `${a} ${n}`).join(', ')}`);
+  process.exit(0);
+}
+
+// --quiet: one row per accepted learn commit whose added sentences are still in the file.
+const commits = git('log', '--format=%H%x09%h%x09%ad%x09%s', '--date=short', '--grep=^learn(', '--', 'agents', 'skills', 'templates')
+  .split('\n').filter(Boolean).map(l => { const [sha, short, date, subject] = l.split('\t'); return { sha, short, date, subject }; })
+  .filter(c => { const m = c.subject.match(/^learn\(([a-z-]+)\)/); if (!m || /^learn\([a-z_]+ \d/.test(c.subject)) return false; c.target = m[1]; return true; });
+const rows = [];
+for (const c of commits) {
+  if (opt.agent && c.target !== opt.agent) continue;
+  const files = git('show', '--format=', '--name-only', c.sha, '--', 'agents', 'skills', 'templates').split('\n').filter(Boolean);
+  for (const f of files) {
+    const now = fs.existsSync(path.join(HOLDEN, f)) ? norm(fs.readFileSync(path.join(HOLDEN, f), 'utf8')) : '';
+    const before = norm(git('show', `${c.sha}^:${f}`));
+    const added = git('show', '--format=', '--unified=0', c.sha, '--', f).split('\n')
+      .filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => norm(l.slice(1))).filter(t => t.length > 20 && !before.includes(t));
+    if (!added.length) continue;
+    const present = added.filter(t => now.includes(t));
+    if (!present.length) continue;
+    const phasesSince = new Set(obs.filter(o => o.date > c.date).map(o => o.phase)).size;
+    const linesSince = obs.filter(o => o.date > c.date && !o.clean && o.agent === c.target).length;
+    rows.push({ c, f, added: added.length, present: present.length, phasesSince, linesSince, sample: present[0] });
+  }
+}
+const quiet = rows.filter(r => r.phasesSince >= opt.phases).sort((a, b) => a.c.date.localeCompare(b.c.date));
+for (const r of quiet) {
+  console.log(`${r.c.short} ${r.c.date} ${r.c.subject}`);
+  console.log(`  ${r.f}: ${r.present} of ${r.added} added lines still present; ${r.phasesSince} phases since, ${r.linesSince} ${r.c.target} lines since`);
+  console.log(`  "${r.sample.slice(0, 140)}${r.sample.length > 140 ? '…' : ''}"`);
+}
+console.error(`${quiet.length} candidates (learn edits still present, ${opt.phases}+ phases old) of ${rows.length} still present`);

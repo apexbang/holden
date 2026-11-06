@@ -1,0 +1,8 @@
+# Open asks. One sentence each; history lives at the pointer, never here.
+asks:
+  - id: example-ask
+    status: open           # open | shipped-awaiting-check | deferred | blocked
+    priority: amber        # red | amber | green | white
+    ask: One sentence saying what is wanted and why it matters.
+    pointer: .planning/OPEN-ASKS.md#example-ask
+    since: 2026-01-01
