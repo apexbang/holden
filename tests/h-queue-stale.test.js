@@ -312,8 +312,9 @@ test('two waiters for one path: one is granted first', async () => {
     assert.equal(pkgOf(t, second).state, 'parked');
     onBranch(t.root, first, 'a.txt', 'again\n', 'change a again', t.env);
     ok(land(t, first));
-    const r = await within(ws[first === '261018-1' ? 1 : 0].done, 10000);
-    assert.ok(r, 'the second waiter did not end within 10 s');
+    // It re-admits and makes a worktree, which outlasts a short limit on a busy machine: this limit is for a hang.
+    const r = await within(ws[first === '261018-1' ? 1 : 0].done, 60000);
+    assert.ok(r, 'the second waiter did not end within 60 s');
     assert.equal(r.code, 0, r.out);
     assert.deepEqual(pkgOf(t, second).writes, ['a.txt']);
   } finally { ws.forEach(kill); }
